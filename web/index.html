@@ -7,7 +7,7 @@
   <!-- 地図を描く道具 Leaflet 1.9.4（web/vendor に同梱。背景の実地図は使わず、白地に道路だけを描く） -->
   <link rel="stylesheet" href="/web/vendor/leaflet/leaflet.css">
   <script src="/web/vendor/leaflet/leaflet.js"></script>
-  <link rel="stylesheet" href="/web/style.css">
+  <link rel="stylesheet" href="/web/style.css?v=20261105c">
 </head>
 <body>
 
@@ -96,16 +96,13 @@
           <label>予備バッテリーの総数<input type="number" id="f-spare-total" step="1" min="0"></label>
           <h3>震源から被害をつくるとき</h3>
           <label>センサーが被害を受ける範囲（km）<input type="number" id="d-s-radius" step="5" min="0"></label>
-          <label>センサーの被害の強さ（0〜1）<input type="number" id="d-s-strength" step="0.1" min="0" max="1"></label>
+          <label>センサーの被害の強さ（範囲の中で通信断になる確率 0〜1）<input type="number" id="d-s-strength" step="0.1" min="0" max="1"></label>
           <label>道路が被害を受ける範囲（km）<input type="number" id="d-r-radius" step="5" min="0"></label>
           <label>道路の被害の強さ（0〜1）<input type="number" id="d-r-strength" step="0.1" min="0" max="1"></label>
-          <h3>QUBO</h3>
-          <label>同じセンサーを回る飛行を各拠点から何本残すか<input type="number" id="q-cand" step="1" min="1" max="10" value="1"></label>
-          <label>回復時刻の合計の重み（w_lat）<input type="number" id="q-wlat" step="0.1" value="1"></label>
-          <label>長いルートを嫌う強さ（p）<input type="number" id="q-pow" step="0.5" value="2"></label>
-          <label>罰金の強さ（倍率）<input type="number" id="q-penalty" step="0.5" value="1"></label>
-          <label>上限時刻 T を変えて解く回数<input type="number" id="q-rounds" step="1" min="1" max="20" value="8"></label>
-          <label>Amplify の制限時間（ミリ秒）<input type="number" id="q-time" step="500" min="100" value="3000"></label>
+          <h3>QUBO（②飛行の選択 → ③ルートの数え上げ → ④ルートの選択）</h3>
+          <label>1台が飛ぶ最大回数（③の数え上げ。増やすと候補が急に増える。6 以上で予備バッテリーのルートも作る）<input type="number" id="q-max-flights" step="1" min="1" max="9" value="3"></label>
+          <label>罰則の強さ（倍率）<input type="number" id="q-penalty" step="0.5" value="1"></label>
+          <label>Amplify の制限時間（ミリ秒・②と④で1回ずつ）<input type="number" id="q-time" step="500" min="100" value="3000"></label>
         </details>
         <button id="btn-p2-solve" class="primary wide">▶ ドローンの巡回を計算（QUBO）</button>
         <div id="p2-status" class="status"></div>
@@ -154,6 +151,6 @@
   </div>
 </div>
 
-<script src="/web/app.js"></script>
+<script src="/web/app.js?v=20261105c"></script>
 </body>
 </html>

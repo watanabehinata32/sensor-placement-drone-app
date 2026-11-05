@@ -9,8 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 from amplify import AcceptableDegrees, Model
 
-from .routing_qubo import QuboProblem
-from .solvers import LocalAnnealer, TabuSearch
+from .solvers import LocalAnnealer, QuboProblem, TabuSearch
 
 
 class LocalResult:
@@ -47,8 +46,7 @@ class LocalSAClient:
             else:
                 i, j = sorted(key)
                 pairs[(i, j)] = pairs.get((i, j), 0.0) + c
-        prob = QuboProblem(n=n, linear=h, quadratic=pairs, const=const, x_keys=[], spare_var={}, slack_vars=[],
-                           sensor_groups=[], T=1.0, K=1, meta=dict(A=float(np.abs(h).max() if n else 1.0)))
+        prob = QuboProblem(n=n, linear=h, quadratic=pairs, const=const, meta=dict(A=float(np.abs(h).max() if n else 1.0)))
         t = time.perf_counter()
         if self.method == 'tabu':
             x, _ = TabuSearch(iters_per_var=40, restarts=4).solve(prob)

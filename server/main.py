@@ -10,7 +10,8 @@
   （開いている人ごとに状態が混ざらず、作りも簡単になるため）。
 - 覚えておくのは、起動時に 1 回だけ読むデータ（道路網など）と、二段階目の計算の進み具合だけ。
 - ソルバーは Amplify AE。トークンは .env（環境変数 AMPLIFY_TOKEN）から読み、画面にもログにも出さない。
-  トークンがないときだけ、確認用に手元のタブーサーチで解く（画面に「確認用」と出す）。
+  一段階目だけは、トークンがないとき確認用に手元のタブーサーチで解く（画面に「確認用」と出す）。
+  二段階目は Amplify だけで解く（トークンがなければ、その旨を画面に出して止める）。
 """
 import json
 import os
@@ -18,7 +19,6 @@ import threading
 import time
 import uuid
 
-import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -28,15 +28,16 @@ from core import phase1
 from core.config import Config, FleetSpec
 from core.damage import make_damage
 from core.data_io import load_roads, load_scenario, load_sensors
-from core.optimize import repair, solve_routing
+from core.phase2 import solve_phase2 as solve_phase2_steps
 from core.preprocess import RoadNetwork
-from core.routing import build_instance, evaluate
-from core.routing_qubo import Weights
-from core.solvers import AmplifySolver, TabuSearch, make_amplify_client
+from core.solvers import make_amplify_client
 from server.settings import APP_DIR, amplify_token
 
 DATA_DIR = os.path.join(APP_DIR, 'data')
-ROADS_DIR = os.path.join(DATA_DIR, 'roads')   # 道路データ（phase2_roads_v2 のコピー。本データが来たらここを差し替える）
+# 道路データ: 先方（国際航業）から届いた本データ（2026-11-04）。中身は phase2_roads_company/ と同じ。
+# 前の仮データ（資料の図から作った phase2_roads_v2）に戻すときは 'roads_company' を 'roads' にし、
+# scenario を 'scenario_eq_tonan_west.json'、loader_config を None にする。
+ROADS_DIR = os.path.join(DATA_DIR, 'roads_company')
 WEB_DIR = os.path.join(APP_DIR, 'web')
 PATHS = dict(
     sensors=os.path.join(DATA_DIR, 'data_transformed.json'),          # 一段階目の配布データ（候補地点・市町村）
@@ -44,7 +45,8 @@ PATHS = dict(
     segments=os.path.join(ROADS_DIR, 'road_segments.geojson'),
     nodes=os.path.join(ROADS_DIR, 'road_nodes.geojson'),
     facilities=os.path.join(ROADS_DIR, 'facilities.geojson'),
-    scenario=os.path.join(ROADS_DIR, 'scenario_eq_tonan_west.json'),  # サンプルの地震（最初に表示する被害）
+    scenario=os.path.join(ROADS_DIR, 'scenario.json'),                # 先方のサンプルの地震（最初に表示する被害）
+    loader_config=os.path.join(ROADS_DIR, 'loader_config.json'),     # 道路の読み込み設定（車の速度は先方シナリオの値）
     style=os.path.join(ROADS_DIR, 'style.json'),                      # 資料の凡例の色
 )
 
@@ -59,7 +61,7 @@ def read_json(path):
 # ============================================================
 print('データを読み込んでいます…')
 PHASE1_DATA = phase1.load_phase1_data(PATHS['sensors'])
-SEGMENTS, NODES = load_roads(PATHS['segments'], PATHS['nodes'])
+SEGMENTS, NODES = load_roads(PATHS['segments'], PATHS['nodes'], config=PATHS['loader_config'])
 ALL_SENSORS = load_sensors(PATHS['sensors'])          # 候補地点 86 か所 {ID: (x, y, 市町村 ID)}
 SCENARIO = load_scenario(PATHS['scenario'])
 # 道路網（離陸候補点）は候補地点 86 か所すべてで 1 回だけ作る。
@@ -83,7 +85,7 @@ def get_map():
     """地図に描くもの全部（県・市町村・候補地点・道路・拠点・凡例の色）と、サンプルの被害・初期の設定."""
     raw = PHASE1_DATA['raw']
     roads = [dict(id=s['segment_id'], cls=s['highway'], name=s['name'] or '',
-                  cls_ja=SEGMENT_INFO.get(s['segment_id'], {}).get('road_class_ja', ''),
+                  cls_ja=SEGMENT_INFO.get(s['segment_id'], {}).get('road_class_ja') or SEGMENT_INFO.get(s['segment_id'], {}).get('road_type', ''),
                   coords=[[round(x, 1), round(y, 1)] for x, y in s['coords']])
              for s in SEGMENTS]
     facilities = [dict(f['properties'], x=f['geometry']['coordinates'][0], y=f['geometry']['coordinates'][1])
@@ -111,7 +113,7 @@ def get_map():
         defaults=dict(phase1=phase1.DEFAULTS,
                       fleet=dict(charge_min=fleet.charge_min, flights_builtin=fleet.flights_builtin,
                                  flights_per_spare=fleet.flights_per_spare, spare_total=fleet.spare_total),
-                      damage=dict(sensor_radius_km=35.0, sensor_strength=1.0, road_radius_km=15.0, road_strength=0.5)),
+                      damage=dict(sensor_radius_km=20.0, sensor_strength=1.0, road_radius_km=20.0, road_strength=0.5)),
         solver=solver_label(),
     )
 
@@ -196,9 +198,9 @@ def exact_placement():
 class DamageRequest(BaseModel):
     placed_ids: list       # 設置したセンサーの地点 ID
     epicenter: list        # [x, y]
-    sensor_radius_km: float = 35.0
+    sensor_radius_km: float = 20.0
     sensor_strength: float = 1.0
-    road_radius_km: float = 15.0
+    road_radius_km: float = 20.0
     road_strength: float = 0.5
     seed: int = 0
 
@@ -234,20 +236,18 @@ class Phase2Request(Conditions):
     charge_min: float = 30.0
     flights_builtin: int = 5
     flights_per_spare: int = 4
-    spare_total: int = 2
-    cand_per_base: int = 1
-    w_lat: float = 1.0
-    pos_power: float = 2.0
-    penalty: float = 1.0                # 罰金の強さ
-    rounds: int = 8
-    time_limit_ms: int = 3000           # Amplify の 1 回あたりの制限時間（1000 → 3000 ミリ秒）
+    spare_total: int = 1                # 先方シナリオ: 全体で 1 個
+    max_flights_per_route: int = 3      # ③で数え上げる、1 台が飛ぶ回数の上限（増やすとルートの候補が急に増える）
+    penalty: float = 1.0                # 罰則の強さ（倍率）
+    time_limit_ms: int = 3000           # Amplify の 1 回あたりの制限時間（②と④で 1 回ずつ解く）
 
 
-JOBS = {}                 # 受付番号 → {"status", "history", "result", "error"}
+JOBS = {}                 # 受付番号 → {"status", "stage", "result", "error"}
 
 
-def route_result(inst, out, closed, bases):
+def route_result(out, closed, bases):
     """解いたルートを、地図と時刻表に描ける形にする."""
+    inst = out['inst']
     legs = []
     for v, route in out['routes'].items():
         if route:
@@ -267,45 +267,38 @@ def route_result(inst, out, closed, bases):
         flights = [dict(order=i + 1, launch=[inst.flights[f].x, inst.flights[f].y], launch_id=inst.flights[f].launch_id,
                         sensors=inst.flights[f].sensors) for i, f in enumerate(route)]
         table = ev['vehicles'][v]
-        # 画面に出す名前（例: B1-2 → 「県庁 2号車」）
-        name = f"{veh.base_name} {veh.vehicle_id.split('-')[-1]}号車"
+        # 画面に出す名前（例: B1-2 → 「新緑県庁 2号車」）
+        # 拠点名のかっこ書き（例:「（災害対策本部）」）は時刻表などでは長すぎるので外す. 地図の拠点ラベルはそのまま
+        base_short = veh.base_name.split('（')[0]
+        name = f"{base_short} {veh.vehicle_id.split('-')[-1]}号車"
         vehicles.append(dict(id=veh.vehicle_id, name=name, base_id=veh.base_id, path=line if route else [], legs=legs_xy if route else [], flights=flights,
                              events=table['events'], end_recovery=table['end_recovery'], end_return=table['end_return'],
                              spare=table['spare']))
     return dict(vehicles=vehicles, recover_time={s: round(t, 2) for s, t in ev['recover_time'].items()},
-                targets=inst.targets, unreachable=inst.unreachable, missing=ev['missing'],
+                targets=inst.targets, unreachable=inst.unreachable, missing=out['missing'],
+                violations=out['violations'], steps=out['steps'],
                 makespan=ev['makespan'], makespan_recovery=ev['makespan_recovery'],
                 makespan_return=ev['makespan_return'], feasible=ev['feasible'],
-                lower_bound=out['lower_bound'], proven_optimal=out['proven_optimal'], repaired=out['repaired'],
                 hover_min=inst.cfg.drone.hover_min, seconds=out['seconds'], solver=solver_label())
 
 
 def run_phase2(job_id, req):
-    """別のスレッドで二段階目を解く（画面を待たせないため）."""
+    """別のスレッドで二段階目を解く（画面を待たせないため）. ①前処理 → ②〜⑤ は core/phase2.py."""
     job = JOBS[job_id]
     try:
+        token = amplify_token()
+        if not token:
+            raise ValueError('Amplify のトークンが設定されていません（二段階目は Amplify だけで解きます。'
+                             'sensor_app/.env に AMPLIFY_TOKEN を書いてください）')
         cfg = Config()
         cfg.fleet = FleetSpec(charge_min=req.charge_min, flights_builtin=req.flights_builtin,
                               flights_per_spare=req.flights_per_spare, spare_total=req.spare_total)
-        res = NETWORK.run(req.closed, req.down, req.bases)
-        inst = build_instance(res, cfg, end_mode=req.end_mode, cand_per_base=req.cand_per_base, extra_cand=1)
-        if not inst.targets:
-            raise ValueError('ドローンで回復できる通信断センサーがありません（被害を設定してください）')
-        if not inst.vehicles:
-            raise ValueError('車が 0 台です（詳しい設定で台数を決めてください）')
-        token = amplify_token()
-        solver = AmplifySolver(make_amplify_client(token, req.time_limit_ms)) if token else TabuSearch()
-        weights = Weights(w_lat=req.w_lat, penalty=req.penalty, pos_power=req.pos_power)
-        # 上限時刻 T の最初の値: 下限（とても小さい）から始めると、最初の何回かは T が小さすぎて
-        # 「全部は回れない」QUBO を解くだけで終わってしまう。そこで、手早い答え（貪欲法）の終了時刻を最初の T にし、
-        # そこから QUBO で T を小さくしていく。貪欲法の答えそのものは使わない（T を決めるだけ）。
-        greedy_routes, greedy_spares, _ = repair(inst, {}, {})
-        greedy_end = evaluate(inst, greedy_routes, greedy_spares)['makespan']
-        out = solve_routing(inst, solver, weights=weights, rounds=req.rounds, T_start=greedy_end + 1e-6,
-                            progress=lambda h: job['history'].append(h))
-        if not out['ok']:
-            raise ValueError('全センサーを回る解が見つかりませんでした（詳しい設定で罰金の強さや解く回数を増やしてください）')
-        job['result'] = route_result(inst, out, req.closed, req.bases)
+        job['stage'] = '① 前処理（走行時間と飛行の数え上げ）'
+        pre = NETWORK.run(req.closed, req.down, req.bases)
+        out = solve_phase2_steps(pre, cfg, make_amplify_client(token, req.time_limit_ms), end_mode=req.end_mode,
+                                 penalty=req.penalty, max_flights_per_route=req.max_flights_per_route,
+                                 progress=lambda text: job.update(stage=text))
+        job['result'] = route_result(out, req.closed, req.bases)
         job['status'] = 'done'
     except Exception as error:
         job['error'] = str(error)
@@ -315,7 +308,7 @@ def run_phase2(job_id, req):
 @app.post('/api/phase2/solve')
 def solve_phase2(req: Phase2Request):
     job_id = uuid.uuid4().hex[:12]
-    JOBS[job_id] = dict(status='running', history=[], result=None, error=None, rounds=req.rounds)
+    JOBS[job_id] = dict(status='running', stage='受付', result=None, error=None)
     threading.Thread(target=run_phase2, args=(job_id, req), daemon=True).start()
     return dict(job_id=job_id)
 
@@ -325,9 +318,7 @@ def phase2_job(job_id: str):
     if job_id not in JOBS:
         raise HTTPException(404, 'その受付番号はありません（サーバーを起動し直した可能性があります）')
     job = JOBS[job_id]
-    # 進み具合の記録は numpy の数を含むことがあるので、ふつうの数に直して返す
-    history = [{k: (v.item() if isinstance(v, np.generic) else v) for k, v in h.items()} for h in job['history']]
-    return dict(status=job['status'], history=history, rounds=job['rounds'], result=job['result'], error=job['error'])
+    return dict(status=job['status'], stage=job['stage'], result=job['result'], error=job['error'])
 
 
 # ============================================================

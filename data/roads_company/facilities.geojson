@@ -1,0 +1,133 @@
+{
+ "type": "FeatureCollection",
+ "crs": {
+  "type": "name",
+  "properties": {
+   "name": "+proj=aeqd +lat_0=0 +lon_0=0 +datum=WGS84 +units=m +no_defs"
+  }
+ },
+ "features": [
+  {
+   "type": "Feature",
+   "properties": {
+    "facility_id": "西南IC",
+    "kind": "ic",
+    "name": "西南IC",
+    "node_id": "N00017",
+    "municipality_id": "M03"
+   },
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     -30675.5,
+     -18479.0
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "facility_id": "中央JCT",
+    "kind": "jct",
+    "name": "中央JCT",
+    "node_id": "N00051",
+    "municipality_id": "M06"
+   },
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     -2000.0,
+     -4500.0
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "facility_id": "北東IC",
+    "kind": "ic",
+    "name": "北東IC",
+    "node_id": "N00093",
+    "municipality_id": "M08"
+   },
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     30742.9,
+     20075.4
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "facility_id": "北西IC",
+    "kind": "ic",
+    "name": "北西IC",
+    "node_id": "N00146",
+    "municipality_id": "M04"
+   },
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     -3081.6,
+     33405.3
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "facility_id": "B1",
+    "kind": "drone_base",
+    "name": "新緑県庁（災害対策本部）",
+    "node_id": "N00164",
+    "municipality_id": "M06",
+    "dock_vehicles": 4
+   },
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     2299.0,
+     3999.9
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "facility_id": "B2",
+    "kind": "drone_base",
+    "name": "西南市役所",
+    "node_id": "N00276",
+    "municipality_id": "M03",
+    "dock_vehicles": 2
+   },
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     -30664.6,
+     -28090.8
+    ]
+   }
+  },
+  {
+   "type": "Feature",
+   "properties": {
+    "facility_id": "B3",
+    "kind": "drone_base",
+    "name": "北東町役場",
+    "node_id": "N00407",
+    "municipality_id": "M08",
+    "dock_vehicles": 2
+   },
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     31727.2,
+     18863.4
+    ]
+   }
+  }
+ ]
+}

@@ -1,4 +1,4 @@
-"""二段階目をサンプルの地震で 1 回だけ解き、後処理で足したセンサーの数を出す（Amplify の確認用）.
+"""二段階目をサンプルの地震で 1 回だけ Amplify で解き、未回収と決まり違反の数を出す（Amplify の確認用）.
 
 sensor_app フォルダで:  python3 tools/check_phase2.py
 """
@@ -23,4 +23,6 @@ if answer['status'] != 'done':
 else:
     r = answer['result']
     print(f"ソルバー {r['solver']}・最後の回復 {r['makespan_recovery']} 分・回復 {len(r['recover_time'])}/{len(r['targets'])} 基・"
-          f"後処理で追加 {len(r['repaired'])} 基・計算 {r['seconds']} 秒")
+          f"未回収 {len(r['missing'])} 基・決まり違反 {len(r['violations'])} 件・計算 {r['seconds']} 秒")
+    for text in r['violations']:
+        print('  違反:', text)

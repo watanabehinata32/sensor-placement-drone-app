@@ -1,0 +1,114 @@
+{
+ "scenario_id": "sample_01",
+ "title": "東南村西部を震源とする地震（先方サンプル sample_01）",
+ "description": "サンプル: 東南村西部を震源とする地震。震源から約20km以内のセンサーが通信断、周辺の橋梁・トンネル区間などが通行止め。",
+ "drone_bases": [
+  {
+   "facility_id": "B1",
+   "node_id": "N00164",
+   "name": "新緑県庁（災害対策本部）",
+   "vehicles": 4
+  },
+  {
+   "facility_id": "B2",
+   "node_id": "N00276",
+   "name": "西南市役所",
+   "vehicles": 2
+  },
+  {
+   "facility_id": "B3",
+   "node_id": "N00407",
+   "name": "北東町役場",
+   "vehicles": 2
+  }
+ ],
+ "comm_down_sensors": [
+  "P02_1",
+  "P02_7",
+  "P06_2",
+  "P06_5",
+  "P06_8",
+  "P06_9",
+  "P07_1",
+  "P07_10",
+  "P07_11",
+  "P07_12",
+  "P07_2",
+  "P07_3",
+  "P07_4",
+  "P07_5",
+  "P07_6",
+  "P07_7",
+  "P07_8",
+  "P07_9"
+ ],
+ "closed_segments": [
+  "S00052",
+  "S00063",
+  "S00067",
+  "S00071",
+  "S00074",
+  "S00079",
+  "S00380",
+  "S00383",
+  "S00384",
+  "S00395",
+  "S00756",
+  "S00763",
+  "S00840",
+  "S00847",
+  "S00962",
+  "S01262",
+  "S01265",
+  "S01312",
+  "S01327",
+  "S01344",
+  "S01348",
+  "S01351",
+  "S01352",
+  "S01359",
+  "S01361",
+  "S01369",
+  "S01382",
+  "S01387",
+  "S01539",
+  "S01541",
+  "S01664",
+  "S01667",
+  "S01672",
+  "S01683"
+ ],
+ "fleet": {
+  "drones_per_vehicle": 1,
+  "max_spare_batteries_per_vehicle": 1,
+  "total_spare_batteries": 1
+ },
+ "drone": {
+  "max_flight_time_min": 15,
+  "cruise_speed_kmh": 40,
+  "max_round_trip_km": 20,
+  "on_station_time_min": 3,
+  "comm_radius_m": 0
+ },
+ "dock": {
+  "charge_time_min": 30,
+  "internal_charges": 4,
+  "charges_per_spare_battery": 4,
+  "charge_while_moving": true
+ },
+ "vehicle": {
+  "speed_kmh": {
+   "motorway": 60,
+   "motorway_link": 30,
+   "trunk": 40,
+   "primary": 30,
+   "secondary": 20
+  },
+  "launch_setup_time_min": 10,
+  "launchable_highways": [
+   "trunk",
+   "primary",
+   "secondary"
+  ]
+ }
+}

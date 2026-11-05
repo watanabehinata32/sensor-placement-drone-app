@@ -499,8 +499,8 @@ function phase2Request() {
     end_mode: document.querySelector('input[name=end-mode]:checked').value,
     charge_min: +$('f-charge').value, flights_builtin: +$('f-builtin').value,
     flights_per_spare: +$('f-per-spare').value, spare_total: +$('f-spare-total').value,
-    cand_per_base: +$('q-cand').value, w_lat: +$('q-wlat').value, pos_power: +$('q-pow').value,
-    penalty: +$('q-penalty').value, rounds: +$('q-rounds').value, time_limit_ms: +$('q-time').value,
+    max_flights_per_route: +$('q-max-flights').value,
+    penalty: +$('q-penalty').value, time_limit_ms: +$('q-time').value,
   };
 }
 
@@ -512,9 +512,7 @@ $('btn-p2-solve').onclick = () => runWithButton($('btn-p2-solve'), 'p2-status', 
   while (true) {
     await new Promise((resolve) => setTimeout(resolve, 1000));
     const job = await api(`/api/phase2/jobs/${job_id}`);
-    const last = job.history[job.history.length - 1];
-    $('p2-status').textContent = `QUBO を解いています… ${job.history.length} / 最大 ${job.rounds} 回` +
-      (last ? `（上限 T = ${last.T.toFixed(1)} 分 → 終了 ${last.makespan.toFixed(1)} 分）` : '');
+    $('p2-status').textContent = `計算しています… ${job.stage}`;
     if (job.status === 'error') throw new Error(job.error);
     if (job.status === 'done') {
       state.result = job.result;
@@ -692,7 +690,7 @@ function setTime(t) {
     if (done) recovered += 1;
     if (item.recovered !== done) {
       item.marker.setIcon(triangleIcon(done ? '#2b8a3e' : markers.sensor_down.color, markers.sensor_down.size_px, null,
-                                       done ? `${id} ${r.recover_time[id].toFixed(0)}分` : ''));
+                                       done ? `${id} ${r.recover_time[id].toFixed(0)}分` : (r.missing.includes(id) ? `${id} ⚠ 未回収` : '')));
       item.recovered = done;
     }
   }
@@ -766,6 +764,7 @@ function drawResultMap() {
 // 時刻表のできごとの並び（前, 次）→ その間の帯の種類と色
 const BAR_KIND = {
   '出発→到着': ['走行', '#adb5bd'], '着陸→到着': ['走行', '#adb5bd'], '着陸→帰着': ['走行（帰り）', '#dee2e6'],
+  '準備→離陸': ['離陸の準備', '#a5d8ff'], '準備→充電待ち': ['離陸の準備', '#a5d8ff'],
   '充電待ち→離陸': ['充電待ち', '#ffd43b'], '離陸→回復': ['飛行（行き・滞空）', '#2b8a3e'],
   '回復→着陸': ['飛行（帰り）', '#8ce99a'], '回復→回復': ['飛行（次のセンサーへ）', '#69db7c'],
 };
@@ -810,16 +809,17 @@ function timetableHtml(result) {
 function renderPhase3() {
   const r = state.result;
   const notes = [`ソルバー: ${r.solver}・計算 ${r.seconds} 秒`];
-  if (r.proven_optimal) notes.push('下限に届いたので、残した候補の中では最適です');
-  // QUBO の答えで回りきれず、後処理（貪欲法）で付け足したセンサーがあれば、目立つ注意として出す
-  const repairedWarning = r.repaired.length ? `<p class="warning">⚠ QUBO の答えだけでは全部を回れませんでした。
-    ${r.repaired.length} 基（${r.repaired.join('、')}）は、計算のあとに普通のプログラム（貪欲法）で予定に付け足しています。
-    詳しい設定で「罰金の強さ」や「Amplify の制限時間」を上げて、もう一度計算してください。</p>` : '';
-  if (r.missing.length) notes.push(`回れていないセンサー: ${r.missing.join('、')}`);
+  notes.push(`② 飛行の候補 ${r.steps.step2.candidates} 本 → 選んだ飛行 ${r.steps.step2.chosen} 本（離陸地点 ${r.steps.step2.launch_points} か所）`);
+  notes.push(`④ ルートの候補 ${r.steps.step4.n_routes} 本（変数 ${r.steps.step4.n_variables} 個）`);
+  // 回収できなかったセンサー（QUBO の答えのまま。あとから付け足すことはしない）
+  const missingWarning = r.missing.length ? `<p class="warning">⚠ 未回収 ${r.missing.length} 基：${r.missing.join('、')}</p>` : '';
+  // 決まりを守れていない所（罰則が効いていない印）
+  const violationWarning = r.violations.length ? `<p class="warning">⚠ 決まりを守れていない所があります：<br>
+    ${r.violations.join('<br>')}<br>詳しい設定で「罰則の強さ」や「Amplify の制限時間」を上げて、もう一度計算してください。</p>` : '';
   const main = r.endMode === 'return' ? '全車帰着' : '最後の回復';
   $('p3-result').innerHTML = `
     <div id="stale-note" class="note"></div>
-    ${repairedWarning}
+    ${missingWarning}${violationWarning}
     <div class="metrics">
       <div class="metric"><div class="value">${r.makespan_recovery.toFixed(1)} 分</div>
         <div class="label">最後のセンサーの回復${main === '最後の回復' ? '（目的）' : ''}</div></div>
@@ -859,7 +859,7 @@ async function start() {
   $('d-r-radius').value = d.damage.road_radius_km; $('d-r-strength').value = d.damage.road_strength;
   fillPhase1Tables();
   $('base-inputs').innerHTML = state.data.sample.bases.map((b) =>
-    `<label>${b.name}（${b.base_id}）<input type="number" id="base-${b.base_id}" min="0" max="10" value="${b.vehicles}"></label>`)
+    `<label>${b.name.split('（')[0]}（${b.base_id}）<input type="number" id="base-${b.base_id}" min="0" max="10" value="${b.vehicles}"></label>`)
     .join('');
   state.data.sample.bases.forEach((b) => { $(`base-${b.base_id}`).onchange = () => onDamageChanged(); });
 

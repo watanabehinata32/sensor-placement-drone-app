@@ -1,11 +1,11 @@
-"""QUBO を解く部品（ソルバー）.
+"""QUBO を解く部品.
 
-- AmplifySolver … Fixstars Amplify AE で解く（本番用）。トークンはコードに書かず、
-                  .env（環境変数 AMPLIFY_TOKEN）から渡す
-- TabuSearch    … 手元で動くタブーサーチ（確認用。クラウドの作業環境からは Amplify AE に接続できないため）
-- LocalAnnealer … 手元で動く焼きなまし法（確認用）
+- make_amplify_client … Fixstars Amplify AE のクライアントを作る（本番用）。トークンはコードに書かず、
+                        .env（環境変数 AMPLIFY_TOKEN）から渡す
+- TabuSearch / LocalAnnealer … 手元で動く確認用の解き方。一段階目でトークンが無いときだけ使う
+                        （二段階目は Amplify だけで解くので使わない）
 
-どれも solve(prob) → (x: 0/1 の配列, info: dict) という同じ形なので、アプリでは差し替えるだけで使える。
+手元の 2 つは solve(prob) → (x: 0/1 の配列, info: dict) という形。prob は下の QuboProblem。
 
 手元の 2 つは「ある変数 i を反転したらエネルギーがいくつ変わるか」を毎回すばやく求めるため、
 field[i] = linear[i] + Σ_j W[i, j] × x[j]  を持ち歩く。x[i] を 0→1 にするとエネルギーは field[i] 増え、
@@ -14,7 +14,28 @@ field[i] = linear[i] + Σ_j W[i, j] × x[j]  を持ち歩く。x[i] を 0→1 �
 import time
 from datetime import timedelta
 
+from dataclasses import dataclass, field
+
 import numpy as np
+
+
+@dataclass
+class QuboProblem:
+    """係数の表で表した QUBO. エネルギー = const + Σ linear[i]·x_i + Σ quadratic[(i, j)]·x_i·x_j."""
+    n: int                    # 変数の数
+    linear: np.ndarray        # 1 次の係数（長さ n）
+    quadratic: dict           # 2 次の係数 {(i, j): 係数}（i < j）
+    const: float              # 定数
+    sensor_groups: list = field(default_factory=list)   # 焼きなましの「付け替え」に使うまとまり（無くてよい）
+    meta: dict = field(default_factory=dict)
+
+    def matrix(self):
+        """対称行列 W（W[i, j] = W[j, i] = 2 次の係数）."""
+        W = np.zeros((self.n, self.n))
+        for (i, j), c in self.quadratic.items():
+            W[i, j] += c
+            W[j, i] += c
+        return W
 
 
 class TabuSearch:
@@ -134,32 +155,6 @@ class LocalAnnealer:
         return best_x.astype(int), dict(solver=self.name, energy=float(best_e + prob.const),
                                         seconds=round(time.time() - t_start, 3), sweeps=self.sweeps,
                                         restarts=self.restarts)
-
-
-class AmplifySolver:
-    """Fixstars Amplify で解く. client は make_amplify_client で作ったもの（トークンと制限時間を設定済み）."""
-    name = "Fixstars Amplify"
-
-    def __init__(self, client):
-        self.client = client
-
-    def solve(self, prob):
-        import amplify                      # Amplify を使うときだけ読み込む
-        t_start = time.time()
-        gen = amplify.VariableGenerator()
-        m = gen.matrix("Binary", prob.n)    # 行列の形で QUBO を渡す: x^T U x + linear·x + 定数
-        m.quadratic = prob.upper()
-        m.linear = prob.linear
-        m.constant = prob.const
-        result = amplify.solve(amplify.Model(m), self.client)
-        if len(result) == 0:
-            raise RuntimeError("Amplify から解が返ってきませんでした")
-        q = m.variable_array
-        x = np.array(q.evaluate(result.best.values)).round().astype(int)
-        exec_time = getattr(result, "execution_time", None)
-        return x, dict(solver=f"{self.name} ({type(self.client).__name__})", energy=float(result.best.objective),
-                       seconds=round(time.time() - t_start, 3),
-                       execution_seconds=(exec_time.total_seconds() if isinstance(exec_time, timedelta) else None))
 
 
 def make_amplify_client(token, time_limit_ms=1000):

@@ -2,7 +2,7 @@
 
 前処理（preprocess.RoadNetwork.run）の結果を受け取り、
 「どの車が・どの離陸点から・どの順に・どのセンサーへ飛ぶか」を解くための数値をそろえる。
-QUBO（routing_qubo.py）と厳密解（exact.py）は同じ Instance を使うので、比べるときの条件が一致する。
+二段階目の計算（phase2.py）は、この Instance の時間の数え方と評価（evaluate）を使う。
 
 時刻のルール（仮定は README 参照）:
 - 車は時刻 0 に拠点を出て、離陸点まで最短経路で走る。
@@ -72,8 +72,8 @@ class Instance:
 
     # ---- よく使う時間 ----
     def drive_from_base(self, v, f):
-        """車 v の拠点から、飛行 f の離陸点までの走行時間（行けなければ inf）."""
-        return self.drive[self.point_of_base[self.vehicles[v].base_id], self.point_of_flight[f]]
+        """車 v の拠点を出てから、飛行 f の離陸点で離陸できるまでの時間 = 走行 + 離陸の準備（行けなければ inf）."""
+        return self.drive[self.point_of_base[self.vehicles[v].base_id], self.point_of_flight[f]] + self.cfg.fleet.launch_setup_min
 
     def drive_between(self, f, g):
         """飛行 f の離陸点から、飛行 g の離陸点までの走行時間."""
@@ -84,11 +84,12 @@ class Instance:
         return self.drive[self.point_of_flight[f], self.point_of_base[self.vehicles[v].base_id]]
 
     def gap(self, f, g):
-        """f の離陸から、次の g の離陸までの最短時間 = f の飛行 + max(充電, f→g の走行)."""
+        """f の離陸から、次の g の離陸までの最短時間 = f の飛行 + max(充電, f→g の走行 + 離陸の準備).
+        充電は走行中・準備中も進むので、長いほうだけ待てばよい."""
         d = self.drive_between(f, g)
         if not np.isfinite(d):
             return INF
-        return self.flights[f].flight_min + max(self.cfg.fleet.charge_min, d)
+        return self.flights[f].flight_min + max(self.cfg.fleet.charge_min, d + self.cfg.fleet.launch_setup_min)
 
     def time_after_last(self, v, f):
         """最後の飛行 f の離陸から、終了時刻までの分（終了時刻の定義による）."""
@@ -240,8 +241,13 @@ def evaluate(inst, routes, spares=None):
                 left_at = 0.0 if k == 0 else launches[k - 1] + inst.flights[route[k - 1]].flight_min
                 arrive = left_at + inst.drive[prev_point, inst.point_of_flight[f]]
                 events.append(dict(t=arrive, kind="到着", where=flight.launch_id, note=""))
-                if launch - arrive > 1e-6:
-                    events.append(dict(t=arrive, kind="充電待ち", where=flight.launch_id, note=f"{launch - arrive:.1f} 分"))
+                # 着いてから離陸まで: まず離陸の準備（10 分）。準備が終わっても充電が終わっていなければ、残りは充電待ち
+                setup = inst.cfg.fleet.launch_setup_min
+                if setup > 1e-6:
+                    events.append(dict(t=arrive, kind="準備", where=flight.launch_id, note=f"離陸の準備 {setup:.0f} 分"))
+                if launch - (arrive + setup) > 1e-6:
+                    events.append(dict(t=arrive + setup, kind="充電待ち", where=flight.launch_id,
+                                       note=f"充電が終わるまで {launch - arrive - setup:.1f} 分"))
                 events.append(dict(t=launch, kind="離陸", where=flight.launch_id, note=f"{k + 1} 回目の飛行"))
                 for s, offset in zip(flight.sensors, flight.recover_off):
                     events.append(dict(t=launch + offset, kind="回復", where=s, note="3 分滞空おわり"))

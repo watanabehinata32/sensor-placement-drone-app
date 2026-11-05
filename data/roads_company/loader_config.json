@@ -1,0 +1,18 @@
+{
+ "_説明": "先方データ用の road_loader 設定。速度は scenario_sample.json の vehicle.speed_kmh。",
+ "fields": {
+  "maxspeed_kmh": [
+   "__use_scenario_speed__"
+  ],
+  "road_class": [
+   "highway"
+  ]
+ },
+ "default_speed_kmh": {
+  "motorway": 60,
+  "motorway_link": 30,
+  "trunk": 40,
+  "primary": 30,
+  "secondary": 20
+ }
+}

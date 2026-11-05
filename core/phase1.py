@@ -1,9 +1,11 @@
 """一段階目：センサーの配置を QUBO で解く.
 
 phase2_app/page_phase1.py（元は webapp/app.py）の式を、画面と切り離してここに移したもの。
-式は変えていない。初期値は Render に公開している前回のアプリ（GitHub の Optimal-Sensor-Placement-in-Two-Dimensions の
+2026-11-05 カバー率を「報酬」から「制約条件（罰金項 penalty_cover）」に変えた。
+初期値は Render に公開している前回のアプリ（GitHub の Optimal-Sensor-Placement-in-Two-Dimensions の
 app.py）に合わせた: λ_cov = 4、制限時間 5000 ミリ秒、マス目 500 m、中央市のカバー率下限 95%。
 前回のアプリは罰則（1 地点 1 台・α・β）に重みを付けていない（Amplify AE に任せる）ので、λ_one = λ_ab = 1 にしている。
+λ_cov はいまはカバー率の制約（罰金項）の重み。
 
 使い方:
     data = load_phase1_data('data/data_transformed.json')
@@ -114,20 +116,34 @@ def build_model(data, covers, lam_one=1.0, lam_ab=1.0, lam_cov=4.0):
     # コスト関数：置いたセンサーのコストの合計（ほかの項と大きさをそろえるため 1/100 にする）
     total_cost = (cost[np.newaxis, :] / 100 * x).sum()
 
-    # カバー率の報酬：マス目が覆われるほど得をする（同じマス目を何台も覆っても得は増えない）
-    #   マス目 g を覆う変数について −(Σ x − 0.5 Σ x x) を足す。
-    #   全部のマス目で足し合わせると、変数 j の係数は「j が覆うマス目の数」、
-    #   ペア (j, l) の係数は「j と l の両方が覆うマス目の数」になる
-    coverage = 0
-    xf = x.flatten()  # x を1列に並べたもの（j = i * K + k 番目が x[i, k]）
+    # 配置の変数を1列に並べる（j = i * K + k 番目が x[i, k]）
+    xf = x.flatten()
+
+    # 罰金項：市町村ごとに「覆われたマス目の数 ≥ 必要な数」（カバー率を制約条件として入れる）
+    #   「覆われている」を表す 0/1 の変数 y を作り、次の2つを罰金にする。
+    #   ① y ≤ そのマス目を覆えるセンサーの台数（1台も覆っていないのに「覆われている」にはできない）
+    #   ② 覆われたマス目の数 ≥ 必要カバー率 × マス目の数（小数は切り上げ）
+    #   「覆われているのに y = 0」は②の罰金を増やすだけで得がないので、y ≥ x の制約は入れなくてよい。
+    #   報酬と違い、同じマス目を何台で重ねて覆っても得は増えない（y は 0 か 1 だから）。
+    #
+    #   マス目は約 2.5 万個あり、1 個ずつ y を作ると変数が多すぎて解けない（手元で試すとメモリ不足）。
+    #   そこで「覆えるセンサーの組み合わせがまったく同じマス目」を1つのグループにまとめ、
+    #   グループごとに y を1つ作る（約 2600 個になる）。同じグループのマス目は必ず一緒に覆われるので、結果は変わらない。
+    penalty_cover = 0
     for m in range(M):
-        C = covers[m].reshape(len(covers[m]), N * K).astype(float)  # マス目 × 変数 の 0/1 の表
-        one = C.sum(axis=0)  # 変数 j が覆うマス目の数
-        both = C.T @ C       # 変数 j と l の両方が覆うマス目の数
-        w = lam_cov * need_c[m] / len(C)
-        coverage += -w * (one * xf).sum()
-        for j, l in zip(*np.nonzero(np.triu(both, k=1))):
-            coverage += w * 0.5 * both[j, l] * xf[j] * xf[l]
+        cells = covers[m].reshape(len(covers[m]), N * K)  # マス目 × 変数 の True/False の表
+        need_cells = int(np.ceil(need_c[m] * len(cells) - 1e-9))  # 必要なマス目の数（1e-9 は小数の誤差よけ）
+        if need_cells == 0:
+            continue
+        # 覆えるセンサーの組み合わせごとにまとめる（だれも覆えないマス目は、どうやっても覆われないので除く）
+        coverable = cells[cells.any(axis=1)]
+        patterns, cell_counts = np.unique(coverable, axis=0, return_counts=True)
+        y = gen.array('Binary', shape=(len(patterns),))  # y[n] = 1 なら「グループ n のマス目は覆われている」
+        for n in range(len(patterns)):
+            # グループ n を覆っているセンサーの台数（覆える変数だけ 1 を掛けて足す）
+            covering_count = (patterns[n].astype(int) * xf).sum()
+            penalty_cover += lam_cov * less_equal(y[n] - covering_count, 0)                  # ①
+        penalty_cover += lam_cov * greater_equal((cell_counts * y).sum(), need_cells)        # ②
 
     # 罰金項：1つの地点には1台まで
     penalty_one = lam_one * less_equal(x, 1, axis=1)
@@ -140,7 +156,8 @@ def build_model(data, covers, lam_one=1.0, lam_ab=1.0, lam_cov=4.0):
         penalty_ab += lam_ab * greater_equal((alpha[np.newaxis, :] * xm).sum(), need_a[m])
         penalty_ab += lam_ab * greater_equal((beta[np.newaxis, :] * xm).sum(), need_b[m])
 
-    model = total_cost + coverage + penalty_one + penalty_ab
+    # 目的は総コストの最小化。カバー率・1地点1台・α・β はすべて制約（罰金項）として足す
+    model = total_cost + penalty_one + penalty_ab + penalty_cover
     return model, x
 
 

@@ -20,7 +20,7 @@ class DroneSpec:
 
 @dataclass
 class RoadRule:
-    # 高速は走れるが停車（離陸）はできない
+    # 高速は走れるが停車（離陸）はできない（先方シナリオ: 離陸できるのは trunk・primary・secondary だけ）
     no_launch_highways: tuple = ("motorway", "motorway_link")
     # 道路上の離陸候補点の間隔 [m]。区間の両端に加えてこの間隔で区間上に点を置く
     launch_spacing_m: float = 250.0
@@ -36,7 +36,8 @@ class FleetSpec:
     charge_min: float = 30.0          # 着陸後、次に飛べるまでの充電時間。走行中も充電できる（停車して待つ必要はない）
     flights_builtin: int = 5          # 予備なしで飛べる回数（出発時に満充電 1 回 + 内蔵バッテリーで充電 4 回。解釈は仮定）
     flights_per_spare: int = 4        # 予備バッテリー 1 個で増える回数
-    spare_total: int = 2              # 予備バッテリーの総数（サンプルに記載がないので仮定。各車 0 か 1 個）
+    spare_total: int = 1              # 予備バッテリーの総数（先方シナリオ: 全体で 1 個、1 台あたり最大 1 個）
+    launch_setup_min: float = 10.0    # 離陸点に着いてから離陸するまでの準備時間（先方シナリオ）。準備中も充電は進む
 
 
 @dataclass
