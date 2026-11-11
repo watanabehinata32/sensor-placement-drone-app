@@ -111,8 +111,7 @@ def get_map():
         sample=dict(title=SCENARIO['title'], closed=sorted(SCENARIO['closed_segments']), down=SCENARIO['comm_down'],
                     epicenter=SCENARIO['raw'].get('epicenter'), bases=SCENARIO['bases']),
         defaults=dict(phase1=phase1.DEFAULTS,
-                      fleet=dict(charge_min=fleet.charge_min, flights_builtin=fleet.flights_builtin,
-                                 flights_per_spare=fleet.flights_per_spare, spare_total=fleet.spare_total),
+                      fleet=dict(charge_min=fleet.charge_min, flights_builtin=fleet.flights_builtin),
                       damage=dict(sensor_radius_km=20.0, sensor_strength=1.0, road_radius_km=20.0, road_strength=0.5)),
         solver=solver_label(),
     )
@@ -235,9 +234,6 @@ class Phase2Request(Conditions):
     end_mode: str = 'recovery'          # 'recovery' = 最後の回復時刻（資料の目的②）、'return' = 全車帰着
     charge_min: float = 30.0
     flights_builtin: int = 5
-    flights_per_spare: int = 4
-    spare_total: int = 1                # 先方シナリオ: 全体で 1 個
-    max_flights_per_route: int = 3      # ③で数え上げる、1 台が飛ぶ回数の上限（増やすとルートの候補が急に増える）
     penalty: float = 1.0                # 罰則の強さ（倍率）
     time_limit_ms: int = 3000           # Amplify の 1 回あたりの制限時間（②と④で 1 回ずつ解く）
 
@@ -272,8 +268,7 @@ def route_result(out, closed, bases):
         base_short = veh.base_name.split('（')[0]
         name = f"{base_short} {veh.vehicle_id.split('-')[-1]}号車"
         vehicles.append(dict(id=veh.vehicle_id, name=name, base_id=veh.base_id, path=line if route else [], legs=legs_xy if route else [], flights=flights,
-                             events=table['events'], end_recovery=table['end_recovery'], end_return=table['end_return'],
-                             spare=table['spare']))
+                             events=table['events'], end_recovery=table['end_recovery'], end_return=table['end_return']))
     return dict(vehicles=vehicles, recover_time={s: round(t, 2) for s, t in ev['recover_time'].items()},
                 targets=inst.targets, unreachable=inst.unreachable, missing=out['missing'],
                 violations=out['violations'], steps=out['steps'],
@@ -291,12 +286,11 @@ def run_phase2(job_id, req):
             raise ValueError('Amplify のトークンが設定されていません（二段階目は Amplify だけで解きます。'
                              'sensor_app/.env に AMPLIFY_TOKEN を書いてください）')
         cfg = Config()
-        cfg.fleet = FleetSpec(charge_min=req.charge_min, flights_builtin=req.flights_builtin,
-                              flights_per_spare=req.flights_per_spare, spare_total=req.spare_total)
+        cfg.fleet = FleetSpec(charge_min=req.charge_min, flights_builtin=req.flights_builtin)
         job['stage'] = '① 前処理（走行時間と飛行の数え上げ）'
         pre = NETWORK.run(req.closed, req.down, req.bases)
         out = solve_phase2_steps(pre, cfg, make_amplify_client(token, req.time_limit_ms), end_mode=req.end_mode,
-                                 penalty=req.penalty, max_flights_per_route=req.max_flights_per_route,
+                                 penalty=req.penalty,   # 1 台が飛ぶ最大回数は solve_phase2 の中で自動で決める
                                  progress=lambda text: job.update(stage=text))
         job['result'] = route_result(out, req.closed, req.bases)
         job['status'] = 'done'

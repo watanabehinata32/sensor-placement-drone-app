@@ -5,10 +5,10 @@
   ① 前処理（普通のコード）     … 通行止めを除いた道路網で走行時間を求め、各センサーに届く飛行を数え上げる。
                                    どの離陸地点からも届かないセンサーは「対応不能」。（preprocess.py）
   ② 飛行の選択（QUBO その 1）  … 通信断センサーを全部覆う飛行の組を選ぶ（集合被覆）。
-                                   選ばれた飛行の離陸地点が、③で使ってよい離陸地点になる。
+                                   今は使わない（use_flight_selection=False が初期値。2026-11-11）。
   ③ ルートの数え上げ（普通のコード）
                                … 車ごとに「拠点 → 離陸地点で飛行 → … → 拠点」のルートを数え上げる。
-                                   ②で選んだ離陸地点だけ使う／予備バッテリーの有無で飛べる回数が変わる／
+                                   使う離陸地点は①の全部（②を使うときは②で選んだ地点だけ）／
                                    回るセンサーの組が同じルートは、いちばん早く終わる 1 本だけ残す。
   ④ ルートの選択（QUBO その 2）… 各車に 1 本ずつルートを選ぶ（何もしない「空ルート」も選べる）。
   ⑤ 後処理（普通のコード）     … 選んだルートを時刻つきの予定表にし、決まりを守れているか確かめる。
@@ -19,18 +19,21 @@ QUBO の答えで回れなかったセンサーを、あとから別の方法で
 ④ の式（時間は「時間」単位。分のままだと 2 乗が大きくなりすぎるため）:
   H ＝ λ1 ×（各車ちょうど 1 ルートの罰則）
      ＋ λ2 ×（各センサーは「どれか 1 ルートで回収」か「u ＝ 1（未回収の印）」のちょうど 1 つ、の罰則）
-     ＋ λ3 ×（予備バッテリーを使うルートが 2 本同時に選ばれた組の数）
      ＋ A ×（u ＝ 1 の数）
-     ＋（選んだルートの終わる時刻² の合計）
-  重みの大きさは λ ＞ A ＞ 時刻² にする（決まり ＞ 回れるだけ回る ＞ 早く終わる、の順に大事なので）。
+     ＋（選んだルートの終わる時刻³ の合計）
+  予備バッテリーは扱わない（2026-11-11 に外した）。
+  重みの大きさは λ ＞ A ＞ 時刻³ にする（決まり ＞ 回れるだけ回る ＞ 早く終わる、の順に大事なので）。
 """
 import time
-from itertools import combinations
 
 import numpy as np
-from amplify import ConstraintList, Poly, VariableGenerator, greater_equal, less_equal, one_hot, solve
+from amplify import ConstraintList, Poly, VariableGenerator, greater_equal, one_hot, solve
 
 from .routing import build_instance, evaluate, route_times
+
+
+# ④の目的で、終わる時刻を何乗するか（2 だと合計を平均的に小さくし、最後の回復が遅れることがあった）
+TIME_POWER = 3
 
 
 def add_up(variables, numbers, weights=None):
@@ -113,6 +116,24 @@ def decode_flight_selection(inst, z, values):
 # ============================================================
 # ③ ルートの数え上げ（普通のコード）
 # ============================================================
+# 1 台が飛ぶ回数の上限（自動で決めるときの最大）。5 回を超えるとルートの候補が数万本になり重くなるため
+AUTO_MAX_FLIGHTS_CAP = 5
+
+
+def auto_max_flights(n_targets, n_vehicles):
+    """1 台が飛ぶ最大回数を、被害の大きさから自動で決める（2026-11-11 ひなたさんと決めた）.
+
+    最大回数 ＝（回れるセンサー数 ÷ 台数 の切り上げ）＋ 1、ただし 5 回まで。
+      ・切り上げ … 全部の車で同じ数ずつ回れば、全センサーを回れる最小の回数
+      ・＋ 1     … センサーが偏っている所では、近くの車が多めに回った方が早く終わるので 1 回だけ余裕を持たせる
+    今のデータでは 1 回の飛行で回れるセンサーは 1 基なので、回数 ＝ 回れるセンサー数 と考えてよい。
+    """
+    if n_vehicles <= 0:
+        return 1
+    needed = -(-n_targets // n_vehicles)          # 切り上げの割り算
+    return max(1, min(needed + 1, AUTO_MAX_FLIGHTS_CAP))
+
+
 def enumerate_routes(inst, launch_ids, max_flights_per_route):
     """車ごとのルートを数え上げる.
 
@@ -120,20 +141,18 @@ def enumerate_routes(inst, launch_ids, max_flights_per_route):
     使う飛行: ②で選んだ離陸地点から出る飛行すべて（同じ地点から別のセンサーの組を回る飛行も使える）。
     決まり:
       ・1 本のルートの中で、同じセンサーを 2 回回らない
-      ・飛ぶ回数は、予備なしなら flights_builtin 回まで、予備ありなら + flights_per_spare 回まで
-        （予備は全体で spare_total 個。0 個なら予備ありのルートは作らない）
+      ・飛ぶ回数は、内蔵バッテリーで飛べる flights_builtin 回まで
       ・画面の「1 台が回る飛行の最大回数」(max_flights_per_route) も超えない（数え上げが増えすぎないため）
     減らし方:
       ・同じ拠点の車は同じ場所から出るので、ルートは拠点ごとに 1 回だけ数える
       ・途中までの並びは「回ったセンサーの組 ＋ 最後の飛行」が同じなら、いちばん早いものだけ伸ばす
-      ・最後に「回ったセンサーの組 ＋ 予備の有無」が同じなら、いちばん早く終わる 1 本だけ残す
+      ・最後に「回ったセンサーの組」が同じなら、いちばん早く終わる 1 本だけ残す
 
-    戻り値: [{"vehicle": 車の番号, "flights": [飛行の番号...], "sensors": frozenset, "spare": bool, "end_min": 分}, ...]
+    戻り値: [{"vehicle": 車の番号, "flights": [飛行の番号...], "sensors": frozenset, "end_min": 分}, ...]
     """
-    fleet = inst.cfg.fleet
     allowed = set(launch_ids)
     pool = [f for f, flight in enumerate(inst.flights) if flight.launch_id in allowed]
-    longest = min(max_flights_per_route, inst.max_flights(fleet.spare_total > 0))
+    longest = min(max_flights_per_route, inst.max_flights())
 
     routes = []
     first_vehicle_of_base = {}
@@ -164,23 +183,22 @@ def enumerate_routes(inst, launch_ids, max_flights_per_route):
             partial = grown
             finished += list(partial.values())
 
-        # 「センサーの組 ＋ 予備の有無」ごとに、いちばん早く終わる 1 本を残す
+        # 「センサーの組」ごとに、いちばん早く終わる 1 本を残す
         best = {}
         for _, seq in finished:
             _, end_recovery, end_return = route_times(inst, v0, seq)
             end = end_recovery if inst.end_mode == 'recovery' else end_return
             if not np.isfinite(end_return):
                 continue                    # 拠点に帰れないルートは使わない
-            spare = len(seq) > fleet.flights_builtin
-            key = (frozenset(s for f in seq for s in inst.flights[f].sensors), spare)
+            key = frozenset(s for f in seq for s in inst.flights[f].sensors)   # 回ったセンサーの組
             if key not in best or end < best[key][0]:
                 best[key] = (end, seq)
         # 同じ拠点の車それぞれに、同じルートの一覧を配る
         for v, veh in enumerate(inst.vehicles):
             if veh.base_id != base_id:
                 continue
-            for (sensors, spare), (end, seq) in best.items():
-                routes.append(dict(vehicle=v, flights=seq, sensors=sensors, spare=spare, end_min=float(end)))
+            for sensors, (end, seq) in best.items():
+                routes.append(dict(vehicle=v, flights=seq, sensors=sensors, end_min=float(end)))
     return routes
 
 
@@ -194,14 +212,17 @@ def build_route_selection(inst, routes, penalty=1.0):
           u[s] = 1 … センサー s を回収しない（未回収の印。電池や車が足りず回れないときに使う）
 
     H ＝ λ1 ×（各車ちょうど 1 ルートの罰則）＋ λ2 ×（各センサーは 1 ルートで回収か u ＝ 1 のちょうど 1 つ、の罰則）
-       ＋ λ3 ×（予備ありルートが 2 本同時に選ばれた組の数）＋ A ×（u ＝ 1 の数）＋（選んだルートの終わる時刻²の合計）
+       ＋ A ×（u ＝ 1 の数）＋（選んだルートの終わる時刻³の合計）
     """
     n_vehicles = len(inst.vehicles)
     # 空ルートを各車に 1 本ずつ足す（終わる時刻 0、センサーなし）
-    all_routes = list(routes) + [dict(vehicle=v, flights=[], sensors=frozenset(), spare=False, end_min=0.0)
+    all_routes = list(routes) + [dict(vehicle=v, flights=[], sensors=frozenset(), end_min=0.0)
                                  for v in range(n_vehicles)]
     end_hours = np.array([r['end_min'] / 60.0 for r in all_routes])     # 時間単位
-    time_squared = end_hours ** 2
+    # 終わる時刻を TIME_POWER 乗する（2026-11-11 に 2 乗 → 3 乗へ）。
+    # 乗数が大きいほど「いちばん遅い車」を重く見るので、最後の回復時刻を小さくする方向に近づく。
+    # ルートごとに決まった数を掛けるだけなので、何乗にしても式は 2 次（QUBO）のまま。
+    time_squared = end_hours ** TIME_POWER
 
     # 重みの決め方（λ ＞ A ＞ 時刻²）
     #   A: センサーを 1 基多く回ると、ある車のルートが長くなり時刻²がいくらか増える。その増え方の最大
@@ -210,13 +231,13 @@ def build_route_selection(inst, routes, penalty=1.0):
     biggest_square = float(time_squared.max()) if len(all_routes) else 1.0
     A = biggest_square + 1.0
     lam = penalty * (A + biggest_square + 1.0)
-    lam1 = lam2 = lam3 = lam
+    lam1 = lam2 = lam
 
     gen = VariableGenerator()
     r = gen.array('Binary', len(all_routes))
     u = gen.array('Binary', len(inst.targets))
 
-    # 目的: 選んだルートの終わる時刻² の合計 ＋ A ×（未回収の数）
+    # 目的: 選んだルートの終わる時刻³（TIME_POWER 乗）の合計 ＋ A ×（未回収の数）
     objective = add_up(r, range(len(all_routes)), time_squared) + A * add_up(u, range(len(inst.targets)))
 
     # λ1: 各車ちょうど 1 ルート（空ルートも 1 ルートと数える）
@@ -231,21 +252,7 @@ def build_route_selection(inst, routes, penalty=1.0):
         collecting = [i for i, route in enumerate(all_routes) if s in route['sensors']]
         penalty_sensor.append(lam2 * one_hot(add_up(r, collecting) + u[k]))
 
-    # λ3: 予備バッテリーを使うルート
-    spare_routes = [i for i, route in enumerate(all_routes) if route['spare']]
-    spare_total = inst.cfg.fleet.spare_total
-    penalty_spare = Poly()          # 予備ありルートの罰則（式で書く場合）
-    spare_limit = ConstraintList()  # 予備ありルートの罰則（予備が 2 個以上のとき、制約で書く場合）
-    if spare_routes and spare_total == 1:
-        # 予備は全体で 1 個 → 予備ありルートが 2 本同時に選ばれた組の数を罰則にする
-        # （s = 予備ありルートの選んだ本数 とすると、組の数 = s(s−1)/2。0/1 の変数は r×r = r なので式で書ける）
-        s = add_up(r, spare_routes)
-        penalty_spare = lam3 * (s * s - s) / 2
-    elif spare_routes and spare_total < n_vehicles:
-        # 予備が 2 個以上のとき（初期値ではここは通らない）: 予備ありルートの本数 ≦ 予備の総数
-        spare_limit.append(lam3 * less_equal(add_up(r, spare_routes), spare_total))
-
-    model = objective + penalty_spare + penalty_vehicle + penalty_sensor + spare_limit
+    model = objective + penalty_vehicle + penalty_sensor
     info = dict(n_routes=len(routes), n_variables=len(all_routes) + len(inst.targets),
                 A=round(A, 3), lam=round(lam, 3))
     return model, r, u, all_routes, info
@@ -256,7 +263,7 @@ def decode_route_selection(inst, r, u, all_routes, values):
     picked = read_values(r, values)
     marked = read_values(u, values)
     violations = []
-    routes, spares = {}, {}
+    routes = {}
     for v, veh in enumerate(inst.vehicles):
         mine = [i for i, route in enumerate(all_routes) if route['vehicle'] == v and picked[i] == 1]
         if len(mine) != 1:
@@ -265,22 +272,24 @@ def decode_route_selection(inst, r, u, all_routes, values):
             # 2 本以上選ばれたときは、センサーの多いほうを使う（ほかは使わない。直して付け足すことはしない）
             i = max(mine, key=lambda i: len(all_routes[i]['sensors']))
             routes[v] = list(all_routes[i]['flights'])
-            spares[v] = all_routes[i]['spare']
     for k, s in enumerate(inst.targets):
         n = sum(1 for i, route in enumerate(all_routes) if picked[i] == 1 and s in route['sensors']) + marked[k]
         if n != 1:
             violations.append(f'{s}: 「回収」と「未回収の印」が合わせて {n} 個（決まりは 1 個）')
-    n_spare = sum(1 for i, route in enumerate(all_routes) if picked[i] == 1 and route['spare'])
-    if n_spare > inst.cfg.fleet.spare_total:
-        violations.append(f'予備バッテリーを使うルートが {n_spare} 本（予備は {inst.cfg.fleet.spare_total} 個）')
-    return routes, spares, violations, [s for k, s in enumerate(inst.targets) if marked[k] == 1]
+    return routes, violations, [s for k, s in enumerate(inst.targets) if marked[k] == 1]
 
 
 # ============================================================
 # ①〜⑤ を通して解く
 # ============================================================
-def solve_phase2(pre, cfg, client, end_mode='recovery', penalty=1.0, max_flights_per_route=3, progress=None):
+def solve_phase2(pre, cfg, client, end_mode='recovery', penalty=1.0, max_flights_per_route=None, progress=None,
+                 use_flight_selection=False):
     """① の前処理の結果 pre から、②〜⑤ を順に行う.
+
+    use_flight_selection: True なら ② 飛行の選択（集合被覆の QUBO）で離陸地点を絞ってから ③ に進む。
+        False（今の初期値・2026-11-11）なら ② を飛ばし、①で見つけた離陸地点を全部 ③ で使う。
+        ② は走行を見ずに離陸地点を選ぶので、全体で一番良いルートを取りこぼすことがあるため。
+        「全部回る」という決まりは ④ の「センサー担当の罰則」に入っているので、② が無くても守られる。
 
     client: Amplify AE のクライアント（solvers.make_amplify_client で作る）
     progress: 進み具合を画面に伝えるための関数（文字列を受け取る）
@@ -296,38 +305,50 @@ def solve_phase2(pre, cfg, client, end_mode='recovery', penalty=1.0, max_flights
     if not inst.vehicles:
         raise ValueError('車が 0 台です（詳しい設定で台数を決めてください）')
 
-    # ② 飛行の選択
-    say(f'② 飛行の選択を Amplify で解いています（飛行の候補 {len(inst.flights)} 本）')
-    model2, z, info2 = build_flight_selection(inst, penalty)
-    selection = decode_flight_selection(inst, z, solve_with_amplify(model2, client))
+    if use_flight_selection:
+        # ② 飛行の選択（集合被覆の QUBO）で、使う離陸地点を絞る
+        say(f'② 飛行の選択を Amplify で解いています（飛行の候補 {len(inst.flights)} 本）')
+        model2, z, info2 = build_flight_selection(inst, penalty)
+        selection = decode_flight_selection(inst, z, solve_with_amplify(model2, client))
+        launch_ids = selection['launch_ids']
+        uncovered_in_step2 = selection['uncovered']
+        step2_info = dict(used=True, candidates=len(inst.flights), chosen=len(selection['chosen_flights']),
+                          launch_points=len(launch_ids), **info2)
+    else:
+        # ② は飛ばす：①で見つけた離陸地点を全部使う
+        launch_ids = sorted({flight.launch_id for flight in inst.flights})
+        uncovered_in_step2 = []
+        step2_info = dict(used=False, candidates=len(inst.flights), launch_points=len(launch_ids))
 
     # ③ ルートの数え上げ
-    say(f'③ ルートを数え上げています（使う離陸地点 {len(selection["launch_ids"])} か所）')
-    routes = enumerate_routes(inst, selection['launch_ids'], max_flights_per_route)
+    # 1 台が飛ぶ最大回数: 指定が無ければ（None か 0）、回れるセンサー数と台数から自動で決める
+    if not max_flights_per_route:
+        max_flights_per_route = auto_max_flights(len(inst.targets), len(inst.vehicles))
+    say(f'③ ルートを数え上げています（使う離陸地点 {len(launch_ids)} か所・1台 {max_flights_per_route} 回まで）')
+    routes = enumerate_routes(inst, launch_ids, max_flights_per_route)
 
     # ④ ルートの選択
     say(f'④ ルートの選択を Amplify で解いています（ルートの候補 {len(routes)} 本）')
     model4, r, u, all_routes, info4 = build_route_selection(inst, routes, penalty)
-    chosen, spares, violations, marked = decode_route_selection(inst, r, u, all_routes, solve_with_amplify(model4, client))
+    chosen, violations, marked = decode_route_selection(inst, r, u, all_routes, solve_with_amplify(model4, client))
 
     # ⑤ 後処理: 時刻つきの予定表と、決まりの確認（バッテリー・走れるか・重複）は routing.evaluate で行う
     say('⑤ 予定表を作っています')
-    ev = evaluate(inst, chosen, spares)
+    ev = evaluate(inst, chosen)
     if ev['duplicated']:
         violations.append(f'2 回回ったセンサー: {"、".join(ev["duplicated"])}')
     if not ev['battery_ok']:
-        violations.append('飛ぶ回数か予備バッテリーの数が決まりを超えています')
+        violations.append('飛ぶ回数がバッテリーで飛べる回数を超えています')
     if not ev['finite']:
         violations.append('走って行けない区間を含むルートがあります')
     return dict(
         inst=inst, routes=chosen, eval=ev, violations=violations,
         missing=ev['missing'],                       # 回収できなかったセンサー（画面で ⚠ 未回収）
         marked_unrecovered=marked,                   # ④で u ＝ 1（未回収の印）になったセンサー
-        uncovered_in_step2=selection['uncovered'],   # ②でどの飛行にも覆われなかったセンサー
+        uncovered_in_step2=uncovered_in_step2,       # ②でどの飛行にも覆われなかったセンサー（② を飛ばしたときは空）
         steps=dict(
-            step2=dict(candidates=len(inst.flights), chosen=len(selection['chosen_flights']),
-                       launch_points=len(selection['launch_ids']), **info2),
-            step4=info4,
+            step2=step2_info,
+            step4=dict(max_flights_per_route=max_flights_per_route, **info4),
         ),
         seconds=round(time.time() - t_start, 1),
     )

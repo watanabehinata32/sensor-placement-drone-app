@@ -98,10 +98,9 @@ class Instance:
             return flight.flight_min + self.drive_to_base(v, f)    # 着陸して拠点に帰るまで
         return flight.last_recover_off                             # 最後のセンサーの回復まで
 
-    def max_flights(self, spare):
-        """1 台が飛べる回数（予備バッテリーを積むかどうかで変わる）."""
-        fleet = self.cfg.fleet
-        return fleet.flights_builtin + (fleet.flights_per_spare if spare else 0)
+    def max_flights(self):
+        """1 台が飛べる回数（内蔵バッテリーの分だけ。予備バッテリーは扱わない）."""
+        return self.cfg.fleet.flights_builtin
 
 
 def build_instance(res, cfg=None, end_mode="recovery", cand_per_base=1, extra_cand=1):
@@ -204,7 +203,7 @@ def route_times(inst, v, route):
     return launches, end_recovery, end_return
 
 
-def evaluate(inst, routes, spares=None):
+def evaluate(inst, routes):
     """routes = {車の番号: [飛行の番号, ...]} を時刻表にして評価する.
 
     戻り値 dict:
@@ -213,8 +212,6 @@ def evaluate(inst, routes, spares=None):
       vehicles（車ごとの時刻表）、battery_ok、finite（走って行けない区間がないか）、
       feasible（全部回れて、重複なし、走れて、バッテリーも足りる）
     """
-    fleet = inst.cfg.fleet
-    spares = dict(spares or {})
     recover_time, duplicated = {}, []
     vehicle_tables = []
     makespan_recovery = makespan_return = 0.0
@@ -225,10 +222,8 @@ def evaluate(inst, routes, spares=None):
         launches, end_recovery, end_return = route_times(inst, v, route)
         if route and not (np.isfinite(end_recovery) and np.isfinite(end_return)):
             finite = False
-        if len(route) > fleet.flights_builtin and not spares.get(v, False):
-            spares[v] = True       # 予備なしの回数を超えるなら予備を積んだとして数え、総数オーバーは下で判定
-        if len(route) > inst.max_flights(spares.get(v, False)):
-            battery_ok = False
+        if len(route) > inst.max_flights():
+            battery_ok = False     # 内蔵バッテリーで飛べる回数を超えている
 
         # 時刻表（できごとの列）
         events = []
@@ -262,18 +257,15 @@ def evaluate(inst, routes, spares=None):
             makespan_return = max(makespan_return, end_return)
         vehicle_tables.append(dict(
             vehicle_id=veh.vehicle_id, base_id=veh.base_id, route=[inst.flights[f].flight_id for f in route],
-            flights=len(route), spare=bool(spares.get(v, False)),
+            flights=len(route),
             end_recovery=round(end_recovery, 2), end_return=round(end_return, 2), events=events))
 
-    spares_used = sum(1 for t in vehicle_tables if t["spare"])
-    if spares_used > fleet.spare_total:
-        battery_ok = False
     missing = [s for s in inst.targets if s not in recover_time]
     makespan = makespan_recovery if inst.end_mode == "recovery" else makespan_return
     return dict(
         recovered=len(recover_time), missing=missing, duplicated=sorted(set(duplicated)), recover_time=recover_time,
         makespan_recovery=round(makespan_recovery, 2), makespan_return=round(makespan_return, 2),
-        makespan=round(makespan, 2), spares_used=spares_used, battery_ok=battery_ok, finite=finite,
+        makespan=round(makespan, 2), battery_ok=battery_ok, finite=finite,
         feasible=(not missing and not duplicated and finite and battery_ok),
         vehicles=vehicle_tables,
     )

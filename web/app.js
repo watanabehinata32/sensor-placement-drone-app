@@ -498,8 +498,6 @@ function phase2Request() {
     closed: [...state.closed], down: [...state.down], bases: bases(),
     end_mode: document.querySelector('input[name=end-mode]:checked').value,
     charge_min: +$('f-charge').value, flights_builtin: +$('f-builtin').value,
-    flights_per_spare: +$('f-per-spare').value, spare_total: +$('f-spare-total').value,
-    max_flights_per_route: +$('q-max-flights').value,
     penalty: +$('q-penalty').value, time_limit_ms: +$('q-time').value,
   };
 }
@@ -800,7 +798,7 @@ function ganttHtml(result) {
 function timetableHtml(result) {
   return result.vehicles.filter((v) => v.events.length).map((v) => `
     <details><summary>${v.name}（飛行 ${v.flights.length} 回・最後の回復 ${v.end_recovery.toFixed(1)} 分・帰着
-      ${v.end_return.toFixed(1)} 分${v.spare ? '・予備バッテリー使用' : ''}）</summary>
+      ${v.end_return.toFixed(1)} 分）</summary>
       <table><tr><th>時刻（分）</th><th>できごと</th><th>場所</th></tr>
       ${v.events.map((e) => `<tr><td>${e.t.toFixed(1)}</td><td>${e.kind}</td>
         <td>${e.where}${e.note ? '（' + e.note + '）' : ''}</td></tr>`).join('')}</table></details>`).join('');
@@ -809,7 +807,13 @@ function timetableHtml(result) {
 function renderPhase3() {
   const r = state.result;
   const notes = [`ソルバー: ${r.solver}・計算 ${r.seconds} 秒`];
-  notes.push(`② 飛行の候補 ${r.steps.step2.candidates} 本 → 選んだ飛行 ${r.steps.step2.chosen} 本（離陸地点 ${r.steps.step2.launch_points} か所）`);
+  const step2 = r.steps.step2;
+  if (step2.used) {
+    notes.push(`② 飛行の候補 ${step2.candidates} 本 → 選んだ飛行 ${step2.chosen} 本（離陸地点 ${step2.launch_points} か所）`);
+  } else {
+    // ② を飛ばした版：①の離陸地点を全部 ③ に渡している
+    notes.push(`② は飛ばしました（飛行の候補 ${step2.candidates} 本・離陸地点 ${step2.launch_points} か所を全部 ③ で使用）`);
+  }
   notes.push(`④ ルートの候補 ${r.steps.step4.n_routes} 本（変数 ${r.steps.step4.n_variables} 個）`);
   // 回収できなかったセンサー（QUBO の答えのまま。あとから付け足すことはしない）
   const missingWarning = r.missing.length ? `<p class="warning">⚠ 未回収 ${r.missing.length} 基：${r.missing.join('、')}</p>` : '';
@@ -854,7 +858,6 @@ async function start() {
   $('p1-lam-ab').value = d.phase1.lam_ab; $('p1-lam-cov').value = d.phase1.lam_cov;
   $('p1-cross').checked = d.phase1.cross; $('p1-time').value = d.phase1.time_limit_ms;
   $('f-charge').value = d.fleet.charge_min; $('f-builtin').value = d.fleet.flights_builtin;
-  $('f-per-spare').value = d.fleet.flights_per_spare; $('f-spare-total').value = d.fleet.spare_total;
   $('d-s-radius').value = d.damage.sensor_radius_km; $('d-s-strength').value = d.damage.sensor_strength;
   $('d-r-radius').value = d.damage.road_radius_km; $('d-r-strength').value = d.damage.road_strength;
   fillPhase1Tables();

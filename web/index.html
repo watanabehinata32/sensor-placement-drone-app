@@ -91,16 +91,13 @@
           <div id="base-inputs"></div>
           <h3>バッテリー</h3>
           <label>充電時間（分）<input type="number" id="f-charge" step="5" min="0"></label>
-          <label>予備なしで飛べる回数<input type="number" id="f-builtin" step="1" min="1"></label>
-          <label>予備1個で増える回数<input type="number" id="f-per-spare" step="1" min="0"></label>
-          <label>予備バッテリーの総数<input type="number" id="f-spare-total" step="1" min="0"></label>
+          <label>1台が飛べる回数（バッテリー）<input type="number" id="f-builtin" step="1" min="1"></label>
           <h3>震源から被害をつくるとき</h3>
           <label>センサーが被害を受ける範囲（km）<input type="number" id="d-s-radius" step="5" min="0"></label>
           <label>センサーの被害の強さ（範囲の中で通信断になる確率 0〜1）<input type="number" id="d-s-strength" step="0.1" min="0" max="1"></label>
           <label>道路が被害を受ける範囲（km）<input type="number" id="d-r-radius" step="5" min="0"></label>
           <label>道路の被害の強さ（0〜1）<input type="number" id="d-r-strength" step="0.1" min="0" max="1"></label>
-          <h3>QUBO（②飛行の選択 → ③ルートの数え上げ → ④ルートの選択）</h3>
-          <label>1台が飛ぶ最大回数（③の数え上げ。増やすと候補が急に増える。6 以上で予備バッテリーのルートも作る）<input type="number" id="q-max-flights" step="1" min="1" max="9" value="3"></label>
+          <h3>QUBO（③ルートの数え上げ → ④ルートの選択。②飛行の選択は今は使わない）</h3>
           <label>罰則の強さ（倍率）<input type="number" id="q-penalty" step="0.5" value="1"></label>
           <label>Amplify の制限時間（ミリ秒・②と④で1回ずつ）<input type="number" id="q-time" step="500" min="100" value="3000"></label>
         </details>
