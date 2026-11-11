@@ -10,14 +10,14 @@
                                … 車ごとに「拠点 → 離陸地点で飛行 → … → 拠点」のルートを数え上げる。
                                    使う離陸地点は①の全部（②を使うときは②で選んだ地点だけ）／
                                    回るセンサーの組が同じルートは、いちばん早く終わる 1 本だけ残す。
-  ④ ルートの選択（QUBO その 2）… 各車に 1 本ずつルートを選ぶ（何もしない「空ルート」も選べる）。
+  ④ ルートの選択（QUBO その 2）… 拠点ごとに、台数までのルートを選ぶ（どの車が走るかは⑤で割り当てる）。
   ⑤ 後処理（普通のコード）     … 選んだルートを時刻つきの予定表にし、決まりを守れているか確かめる。
 
 ソルバーは Fixstars Amplify AE だけを使う（トークンは .env から読み、ここには書かない）。
 QUBO の答えで回れなかったセンサーを、あとから別の方法で付け足すことはしない（画面で「⚠ 未回収」と出す）。
 
 ④ の式（時間は「時間」単位。分のままだと 2 乗が大きくなりすぎるため）:
-  H ＝ λ1 ×（各車ちょうど 1 ルートの罰則）
+  H ＝ λ1 ×（各拠点で選ぶルートが台数以下、の罰則）
      ＋ λ2 ×（各センサーは「どれか 1 ルートで回収」か「u ＝ 1（未回収の印）」のちょうど 1 つ、の罰則）
      ＋ A ×（u ＝ 1 の数）
      ＋（選んだルートの終わる時刻³ の合計）
@@ -27,7 +27,7 @@ QUBO の答えで回れなかったセンサーを、あとから別の方法で
 import time
 
 import numpy as np
-from amplify import ConstraintList, Poly, VariableGenerator, greater_equal, one_hot, solve
+from amplify import ConstraintList, Poly, VariableGenerator, greater_equal, less_equal, one_hot, solve
 
 from .routing import build_instance, evaluate, route_times
 
@@ -148,7 +148,7 @@ def enumerate_routes(inst, launch_ids, max_flights_per_route):
       ・途中までの並びは「回ったセンサーの組 ＋ 最後の飛行」が同じなら、いちばん早いものだけ伸ばす
       ・最後に「回ったセンサーの組」が同じなら、いちばん早く終わる 1 本だけ残す
 
-    戻り値: [{"vehicle": 車の番号, "flights": [飛行の番号...], "sensors": frozenset, "end_min": 分}, ...]
+    戻り値: [{"base": 拠点の ID, "flights": [飛行の番号...], "sensors": frozenset, "end_min": 分}, ...]
     """
     allowed = set(launch_ids)
     pool = [f for f, flight in enumerate(inst.flights) if flight.launch_id in allowed]
@@ -193,12 +193,11 @@ def enumerate_routes(inst, launch_ids, max_flights_per_route):
             key = frozenset(s for f in seq for s in inst.flights[f].sensors)   # 回ったセンサーの組
             if key not in best or end < best[key][0]:
                 best[key] = (end, seq)
-        # 同じ拠点の車それぞれに、同じルートの一覧を配る
-        for v, veh in enumerate(inst.vehicles):
-            if veh.base_id != base_id:
-                continue
-            for sensors, (end, seq) in best.items():
-                routes.append(dict(vehicle=v, flights=seq, sensors=sensors, end_min=float(end)))
+        # ルートは「拠点ごと」に 1 つの一覧にする（2026-11-11 案A）。
+        # 同じ拠点の車は出発地点も性能も同じなので、どの車が走っても中身は同じ。車ごとに配ると
+        # 「車を入れ替えただけの同じ答え」がたくさんでき、変数も台数倍になるため。どの車が走るかは⑤で決める。
+        for sensors, (end, seq) in best.items():
+            routes.append(dict(base=base_id, flights=seq, sensors=sensors, end_min=float(end)))
     return routes
 
 
@@ -208,16 +207,18 @@ def enumerate_routes(inst, launch_ids, max_flights_per_route):
 def build_route_selection(inst, routes, penalty=1.0):
     """④ のモデルを作る.
 
-    変数  r[i] = 1 … ルート i（ある車の 1 本）を選ぶ。各車に「空ルート」（出発しない）の変数も 1 つ用意する
+    変数  r[i] = 1 … ルート i（ある拠点の 1 本）を選ぶ
           u[s] = 1 … センサー s を回収しない（未回収の印。電池や車が足りず回れないときに使う）
 
-    H ＝ λ1 ×（各車ちょうど 1 ルートの罰則）＋ λ2 ×（各センサーは 1 ルートで回収か u ＝ 1 のちょうど 1 つ、の罰則）
+    H ＝ λ1 ×（各拠点で選ぶルートが台数以下、の罰則）＋ λ2 ×（各センサーは 1 ルートで回収か u ＝ 1 のちょうど 1 つ、の罰則）
        ＋ A ×（u ＝ 1 の数）＋（選んだルートの終わる時刻³の合計）
     """
-    n_vehicles = len(inst.vehicles)
-    # 空ルートを各車に 1 本ずつ足す（終わる時刻 0、センサーなし）
-    all_routes = list(routes) + [dict(vehicle=v, flights=[], sensors=frozenset(), end_min=0.0)
-                                 for v in range(n_vehicles)]
+    # 拠点ごとの台数（選べるルートの本数の上限）
+    cars_at_base = {}
+    for veh in inst.vehicles:
+        cars_at_base[veh.base_id] = cars_at_base.get(veh.base_id, 0) + 1
+    # 「出発しない車」は、その拠点でルートを台数より少なく選ぶことで表すので、空ルートの変数は要らない
+    all_routes = list(routes)
     end_hours = np.array([r['end_min'] / 60.0 for r in all_routes])     # 時間単位
     # 終わる時刻を TIME_POWER 乗する（2026-11-11 に 2 乗 → 3 乗へ）。
     # 乗数が大きいほど「いちばん遅い車」を重く見るので、最後の回復時刻を小さくする方向に近づく。
@@ -240,11 +241,12 @@ def build_route_selection(inst, routes, penalty=1.0):
     # 目的: 選んだルートの終わる時刻³（TIME_POWER 乗）の合計 ＋ A ×（未回収の数）
     objective = add_up(r, range(len(all_routes)), time_squared) + A * add_up(u, range(len(inst.targets)))
 
-    # λ1: 各車ちょうど 1 ルート（空ルートも 1 ルートと数える）
+    # λ1: 各拠点で選ぶルートの本数は、その拠点の台数以下（例: 県庁 4 本以下）
     penalty_vehicle = ConstraintList()
-    for v in range(n_vehicles):
-        mine = [i for i, route in enumerate(all_routes) if route['vehicle'] == v]
-        penalty_vehicle.append(lam1 * one_hot(add_up(r, mine)))
+    for base_id, n_cars in cars_at_base.items():
+        mine = [i for i, route in enumerate(all_routes) if route['base'] == base_id]
+        if len(mine) > n_cars:      # 候補が台数以下なら、決まりは必ず守られるので入れない
+            penalty_vehicle.append(lam1 * less_equal(add_up(r, mine), n_cars))
 
     # λ2: 各センサーは「どれか 1 ルートで回収」か「u ＝ 1」のちょうど 1 つ
     penalty_sensor = ConstraintList()
@@ -264,13 +266,16 @@ def decode_route_selection(inst, r, u, all_routes, values):
     marked = read_values(u, values)
     violations = []
     routes = {}
-    for v, veh in enumerate(inst.vehicles):
-        mine = [i for i, route in enumerate(all_routes) if route['vehicle'] == v and picked[i] == 1]
-        if len(mine) != 1:
-            violations.append(f'{veh.vehicle_id}: ルートが {len(mine)} 本選ばれました（決まりは 1 本）')
-        if mine:
-            # 2 本以上選ばれたときは、センサーの多いほうを使う（ほかは使わない。直して付け足すことはしない）
-            i = max(mine, key=lambda i: len(all_routes[i]['sensors']))
+    # 拠点ごとに、選ばれたルートをその拠点の車へ 1 号車から順に割り当てる
+    for base_id in dict.fromkeys(veh.base_id for veh in inst.vehicles):
+        cars = [v for v, veh in enumerate(inst.vehicles) if veh.base_id == base_id]
+        chosen = [i for i, route in enumerate(all_routes) if route['base'] == base_id and picked[i] == 1]
+        # 終わるのが遅いルートから順に並べる（どの順でも結果は同じ。表示をそろえるため）
+        chosen.sort(key=lambda i: -all_routes[i]['end_min'])
+        if len(chosen) > len(cars):
+            violations.append(f'{base_id}: ルートが {len(chosen)} 本選ばれました（台数は {len(cars)} 台）')
+            # 台数を超えた分は使わない（直して付け足すことはしない）
+        for v, i in zip(cars, chosen):
             routes[v] = list(all_routes[i]['flights'])
     for k, s in enumerate(inst.targets):
         n = sum(1 for i, route in enumerate(all_routes) if picked[i] == 1 and s in route['sensors']) + marked[k]
