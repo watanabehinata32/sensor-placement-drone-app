@@ -16,15 +16,18 @@
 ソルバーは Fixstars Amplify AE だけを使う（トークンは .env から読み、ここには書かない）。
 QUBO の答えで回れなかったセンサーを、あとから別の方法で付け足すことはしない（画面で「⚠ 未回収」と出す）。
 
-④ の式（時間は「時間」単位。分のままだと 2 乗が大きくなりすぎるため）:
-  H ＝ λ1 ×（各拠点で選ぶルートが台数以下、の罰則）
+④ の解き方（2026-11-19 から「締切 D ＋ 二分探索」）:
+  締切 D を決め、終わる時刻が D より遅いルートを外してから、次の式を Amplify で解く。
+  H ＝ A ×（u ＝ 1 の数）
+     ＋ λ1 ×（各拠点で選ぶルートが台数以下、の罰則）
      ＋ λ2 ×（各センサーは「どれか 1 ルートで回収」か「u ＝ 1（未回収の印）」のちょうど 1 つ、の罰則）
-     ＋ A ×（u ＝ 1 の数）
-     ＋（選んだルートの終わる時刻³ の合計）
+  式の中に時刻は入らない。「D までに全部回れるか」だけを聞く。
+  回れたら D を早め、回れなかったら D を遅らせる（二分探索）。D の候補はルートの終わる時刻の一覧。
   予備バッテリーは扱わない（2026-11-11 に外した）。
-  重みの大きさは λ ＞ A ＞ 時刻³ にする（決まり ＞ 回れるだけ回る ＞ 早く終わる、の順に大事なので）。
+  アニーリングは「回れない」を証明できないので、答えは「見つけた中でいちばん早い締切」になる。
 """
 import time
+from bisect import bisect_left
 
 import numpy as np
 from amplify import ConstraintList, Poly, VariableGenerator, greater_equal, less_equal, one_hot, solve
@@ -32,8 +35,9 @@ from amplify import ConstraintList, Poly, VariableGenerator, greater_equal, less
 from .routing import build_instance, evaluate, route_times
 
 
-# ④の目的で、終わる時刻を何乗するか（2 だと合計を平均的に小さくし、最後の回復が遅れることがあった）
-TIME_POWER = 3
+# ④の二分探索で「回れなかった」と出たとき、Amplify の制限時間を何倍にしてもう 1 回だけ解き直すか
+# （アニーリングは本当は回れるのに見つけられないことがあるため。2026-11-19 案 B2）
+RETRY_TIME_FACTOR = 3
 
 
 def add_up(variables, numbers, weights=None):
@@ -205,13 +209,14 @@ def enumerate_routes(inst, launch_ids, max_flights_per_route):
 # ④ ルートの選択（QUBO その 2）
 # ============================================================
 def build_route_selection(inst, routes, penalty=1.0):
-    """④ のモデルを作る.
+    """④ のモデルを作る（routes には締切 D 以内に終わるルートだけを渡す）.
 
     変数  r[i] = 1 … ルート i（ある拠点の 1 本）を選ぶ
-          u[s] = 1 … センサー s を回収しない（未回収の印。電池や車が足りず回れないときに使う）
+          u[s] = 1 … センサー s を回収しない（未回収の印。D までに回れないときに使う）
 
-    H ＝ λ1 ×（各拠点で選ぶルートが台数以下、の罰則）＋ λ2 ×（各センサーは 1 ルートで回収か u ＝ 1 のちょうど 1 つ、の罰則）
-       ＋ A ×（u ＝ 1 の数）＋（選んだルートの終わる時刻³の合計）
+    H ＝ A ×（u ＝ 1 の数）
+       ＋ λ1 ×（各拠点で選ぶルートが台数以下、の罰則）＋ λ2 ×（各センサーは 1 ルートで回収か u ＝ 1 のちょうど 1 つ、の罰則）
+    時刻の項は入れない（締切 D はルートを外すことで守る）。
     """
     # 拠点ごとの台数（選べるルートの本数の上限）
     cars_at_base = {}
@@ -219,27 +224,22 @@ def build_route_selection(inst, routes, penalty=1.0):
         cars_at_base[veh.base_id] = cars_at_base.get(veh.base_id, 0) + 1
     # 「出発しない車」は、その拠点でルートを台数より少なく選ぶことで表すので、空ルートの変数は要らない
     all_routes = list(routes)
-    end_hours = np.array([r['end_min'] / 60.0 for r in all_routes])     # 時間単位
-    # 終わる時刻を TIME_POWER 乗する（2026-11-11 に 2 乗 → 3 乗へ）。
-    # 乗数が大きいほど「いちばん遅い車」を重く見るので、最後の回復時刻を小さくする方向に近づく。
-    # ルートごとに決まった数を掛けるだけなので、何乗にしても式は 2 次（QUBO）のまま。
-    time_squared = end_hours ** TIME_POWER
 
-    # 重みの決め方（λ ＞ A ＞ 時刻²）
-    #   A: センサーを 1 基多く回ると、ある車のルートが長くなり時刻²がいくらか増える。その増え方の最大
-    #      （いちばん遅いルートの時刻²）より A を大きくすれば、「回れるのに回らない」ほうが損になる。
-    #   λ: 決まりを 1 つ破ると、A か時刻²のどちらかを最大でその分だけ得できる。それより大きくする。
-    biggest_square = float(time_squared.max()) if len(all_routes) else 1.0
-    A = biggest_square + 1.0
-    lam = penalty * (A + biggest_square + 1.0)
+    # 重みの決め方（λ ＞ A）
+    #   A: 未回収の印 1 個あたりの損。
+    #   λ: 決まりを 1 つ破ると、1 本のルートで回れる数（最大 most_sensors 基）だけ印を減らして得できる。
+    #      それより大きくして、決まりを破るほうが損になるようにする。
+    A = 1.0
+    most_sensors = max((len(route['sensors']) for route in all_routes), default=1)
+    lam = penalty * (A * most_sensors + 1.0)
     lam1 = lam2 = lam
 
     gen = VariableGenerator()
     r = gen.array('Binary', len(all_routes))
     u = gen.array('Binary', len(inst.targets))
 
-    # 目的: 選んだルートの終わる時刻³（TIME_POWER 乗）の合計 ＋ A ×（未回収の数）
-    objective = add_up(r, range(len(all_routes)), time_squared) + A * add_up(u, range(len(inst.targets)))
+    # 目的: 未回収の印の数（少ないほど良い）
+    objective = A * add_up(u, range(len(inst.targets)))
 
     # λ1: 各拠点で選ぶルートの本数は、その拠点の台数以下（例: 県庁 4 本以下）
     penalty_vehicle = ConstraintList()
@@ -258,6 +258,94 @@ def build_route_selection(inst, routes, penalty=1.0):
     info = dict(n_routes=len(routes), n_variables=len(all_routes) + len(inst.targets),
                 A=round(A, 3), lam=round(lam, 3))
     return model, r, u, all_routes, info
+
+
+def solve_one_deadline(inst, routes, deadline, client, penalty):
+    """締切 deadline（分）以内に終わるルートだけで ④ を 1 回解く.
+
+    戻り値: dict(chosen=各車のルート, violations=決まりを守れていない所, marked=未回収の印のセンサー,
+                 latest=選んだルートでいちばん遅く終わる時刻（分）, info=モデルの大きさ)
+    """
+    usable = [route for route in routes if route['end_min'] <= deadline]
+    model, r, u, all_routes, info = build_route_selection(inst, usable, penalty)
+    values = solve_with_amplify(model, client)
+    chosen, violations, marked = decode_route_selection(inst, r, u, all_routes, values)
+    picked = read_values(r, values)
+    ends = [all_routes[i]['end_min'] for i in range(len(all_routes)) if picked[i] == 1]
+    return dict(chosen=chosen, violations=violations, marked=marked,
+                latest=max(ends) if ends else 0.0, info=info)
+
+
+def solve_by_deadline_search(inst, routes, client, penalty=1.0, say=print):
+    """④ を「締切 D ＋ 二分探索」で解く（2026-11-19 案 A2・B2・C1）.
+
+    1. まず締切をいちばん遅くして（＝全ルートを使って）解き、何基回れるかを確かめる（基準）。
+    2. D の候補 ＝ ルートの終わる時刻を小さい順に並べた一覧（答えは必ずどれかのルートの終わる時刻になるため）。
+       ただし「各センサーを回れるいちばん早い時刻」のうち最も遅いものより前は、絶対に間に合わないので外す。
+    3. 候補の真ん中の D で解く。基準と同じ数だけ回れて決まりも守れていれば「間に合う」→ D を早める。
+       回れなければ制限時間を RETRY_TIME_FACTOR 倍にしてもう 1 回だけ解き、それでも駄目なら D を遅らせる。
+    """
+    # 下の端: 各センサーを回れるいちばん早い時刻を求め、その中で最も遅いもの
+    fastest = {}
+    for route in routes:
+        for s in route['sensors']:
+            fastest[s] = min(fastest.get(s, float('inf')), route['end_min'])
+    lowest_possible = max(fastest.values(), default=0.0)
+    candidates = sorted({route['end_min'] for route in routes if route['end_min'] >= lowest_possible})
+    if not candidates:
+        candidates = [0.0]
+    tries = []                 # 解いた締切の記録
+    baseline_marked = None     # 締切なしで解いたときの未回収の印の数（基準）
+
+    def is_ok(result):
+        """「間に合う」か: 決まりを守れていて、未回収の印が基準より増えていない."""
+        if result['violations']:
+            return False
+        if baseline_marked is None:              # 基準を解いている最中は、決まりさえ守れていれば良い
+            return True
+        return len(result['marked']) <= baseline_marked
+
+    def solve_and_retry(deadline):
+        """1 回解き、間に合わなければ制限時間を延ばしてもう 1 回だけ解く."""
+        result = solve_one_deadline(inst, routes, deadline, client, penalty)
+        tries.append(round(deadline, 2))
+        if is_ok(result):
+            return result
+        normal_limit = client.parameters.time_limit_ms
+        client.parameters.time_limit_ms = normal_limit * RETRY_TIME_FACTOR
+        try:
+            say(f'④ 締切 {deadline:.1f} 分では見つからなかったので、制限時間を {RETRY_TIME_FACTOR} 倍にして解き直しています')
+            again = solve_one_deadline(inst, routes, deadline, client, penalty)
+            tries.append(round(deadline, 2))
+        finally:
+            client.parameters.time_limit_ms = normal_limit      # 次の締切では元の制限時間に戻す
+        return again if is_ok(again) else result
+
+    # 1. 基準（締切をいちばん遅くしたとき）
+    say(f'④ ルートの選択を Amplify で解いています（締切なし・ルートの候補 {len(routes)} 本）')
+
+    best = solve_and_retry(candidates[-1])
+    full_info = best['info']
+    if not is_ok(best):
+        # 締切なしでも決まりを守れなかった。二分探索はせず、その答えを（⚠ つきで）そのまま返す
+        return best, dict(full_info, tries=tries, deadline_min=None)
+    baseline_marked = len(best['marked'])
+
+    # 2〜3. 二分探索（candidates の番号で探す。high はいつも「間に合うとわかっている」番号）
+    low, high = 0, bisect_left(candidates, best['latest'])
+    high = min(high, len(candidates) - 1)
+    while low < high:
+        middle = (low + high) // 2
+        deadline = candidates[middle]
+        say(f'④ 締切 {deadline:.1f} 分で全部回れるか、Amplify で確かめています（候補 {high - low + 1} 個に絞り中）')
+        result = solve_and_retry(deadline)
+        if is_ok(result):
+            best = result
+            # 実際に選ばれたルートの終わる時刻が締切より早ければ、そこまで一気に早める
+            high = min(middle, bisect_left(candidates, result['latest']))
+        else:
+            low = middle + 1
+    return best, dict(full_info, tries=tries, n_solves=len(tries), deadline_min=round(best['latest'], 2))
 
 
 def decode_route_selection(inst, r, u, all_routes, values):
@@ -333,9 +421,9 @@ def solve_phase2(pre, cfg, client, end_mode='recovery', penalty=1.0, max_flights
     routes = enumerate_routes(inst, launch_ids, max_flights_per_route)
 
     # ④ ルートの選択
-    say(f'④ ルートの選択を Amplify で解いています（ルートの候補 {len(routes)} 本）')
-    model4, r, u, all_routes, info4 = build_route_selection(inst, routes, penalty)
-    chosen, violations, marked = decode_route_selection(inst, r, u, all_routes, solve_with_amplify(model4, client))
+    # 締切 D を決めて「D までに全部回れるか」を何回か解き、間に合ういちばん早い D を探す
+    best, info4 = solve_by_deadline_search(inst, routes, client, penalty, say)
+    chosen, violations, marked = best['chosen'], best['violations'], best['marked']
 
     # ⑤ 後処理: 時刻つきの予定表と、決まりの確認（バッテリー・走れるか・重複）は routing.evaluate で行う
     say('⑤ 予定表を作っています')
