@@ -820,6 +820,17 @@ function renderPhase3() {
     };
     if (stopMessages[hybrid.stop_reason]) notes.push(stopMessages[hybrid.stop_reason]);
     if (!hybrid.has_solution) notes.push('条件を満たす計画は得られませんでした');
+    // 最適性の証明状態（証明できていないときは、そのことをはっきり出す）
+    if (hybrid.optimality === 'PROVEN') {
+      notes.push('この回復数での最短であることを確認できました');
+    } else if (hybrid.optimality === 'NOT_PROVEN') {
+      const lb = hybrid.lower_bound_proven;
+      notes.push('最適性は未証明です（制限時間内に見つけた、検証済みの最良の計画）'
+                 + (lb != null ? `・証明済みの下界 ${lb} 分` : ''));
+    }
+    if (hybrid.has_solution && !hybrid.max_recovered_proven) {
+      notes.push('回復数が最大であることも未証明です');
+    }
   } else {
     const step2 = r.steps.step2;
     if (step2.used) {

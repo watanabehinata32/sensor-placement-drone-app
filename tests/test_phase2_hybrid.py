@@ -143,6 +143,31 @@ class HybridSearchTest(unittest.TestCase):
         self.assertTrue(hybrid["deadline_history"][0]["found"])
         self.assertEqual(hybrid["stop_reason"], "DEADLINE_CONVERGED")
 
+    def test_search_failure_raises_only_the_search_lower_bound(self):
+        """締切 D で見つからなくても、上がるのは探索上の暫定下限だけ（証明済み下界は上げない）."""
+        slow = {0: frozenset({"alpha", "beta"})}   # 段1で見つかる、遅めの計画
+
+        def sampled_assignments(problem, client):
+            if problem.unserved_count is None:       # 段1（締切なし）
+                selected = {(s, v) for v, sensors in slow.items() for s in sensors}
+                bits = tuple(int(pair in selected) for pair in problem.pairs)
+                return [problem.decode_bits(bits)]
+            return []                                 # 段2：アニーリングが何も見つけられなかった、とする
+
+        with patch("core.phase2_hybrid.solve_assignment", side_effect=sampled_assignments):
+            result = solve_hybrid(
+                two_vehicle_instance(), lambda iteration, remaining_seconds: None,
+                allow_unserved=True, deadline_step_min=0.5,
+            )
+        hybrid = result["steps"]["hybrid"]
+        self.assertTrue(hybrid["has_solution"])
+        self.assertEqual(result["missing"], [])                       # 検証済みの最良解は残る
+        self.assertTrue(any(not h["found"] for h in hybrid["deadline_history"]))
+        self.assertGreater(hybrid["lower_bound_search"], hybrid["lower_bound_proven"])
+        self.assertLessEqual(hybrid["lower_bound_proven"], hybrid["deadline_upper"])
+        self.assertEqual(hybrid["optimality"], "NOT_PROVEN")
+        self.assertTrue(hybrid["max_recovered_proven"])               # 全部回復できたので N* は証明済み
+
     def test_local_annealer_and_dp_respect_forbidden_assignments(self):
         result = solve_hybrid(
             two_vehicle_instance(), lambda iteration, remaining_seconds: LocalSAClient(sweeps=30),

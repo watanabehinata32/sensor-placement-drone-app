@@ -10,7 +10,12 @@
 示した組（車, 担当の組）は次の QUBO で選べないようにする（カット）。
 
 注意：アニーリングで見つからなかっただけでは「D では無理」と証明できない。
-だから答えは「見つけた中で最短」であって、最短の証明ではない。
+だから二分探索は「ヒューリスティック（経験的なやり方）」として使う（2026-11-20 ひなたさん決定・設計書第10節）。
+下の端は 2 つに分けて持つ。
+  ・証明済み下界 …… 計算で「これより早くは絶対に終わらない」と言える時刻。探索の失敗では上げない
+  ・探索上の暫定下限 … 二分探索で使う下の端。D で見つからなければ D まで上げる（証明ではない）
+答えは「制限時間内に見つけた、検証済みの最良の計画」。最短だと言えるのは
+「上の端 − 証明済み下界」が刻み幅以下になったときだけで、そうでなければ「最適性は未証明」と返す。
 """
 
 import math
@@ -190,7 +195,9 @@ def solve_hybrid(
         max_recovered = n_targets - best_score[0]
 
     # ---- 段2：回復数 N* のまま、締切 D を二分探索して最後の時刻を縮める ------------------
-    upper = lower = None
+    upper = None
+    proven_lower = None      # 証明済み下界（計算で言える「これより早くは無理」）
+    search_lower = None      # 探索上の暫定下限（二分探索の下の端。証明ではない）
     if best and max_recovered > 0 and stop_reason not in ('TIME_LIMIT', 'ANNEALER_ERROR'):
         upper = best_score[1]
         # 下の端：N* 基を回復するなら、どれか 1 基は「各センサーの最短回復時刻」の N* 番目以降になる
@@ -198,13 +205,15 @@ def solve_hybrid(
             min((earliest[sensor, v] for v in vehicles), default=0.0) if vehicles else math.inf
             for sensor, vehicles in eligible.items()
         )
-        lower = fastest[max_recovered - 1]
-        if not math.isfinite(lower):
-            lower = 0.0
-        lower = min(lower, upper)
+        # これは「証明済み下界」：どの計画でもこの時刻より前には N* 基目が回復できない
+        proven_lower = fastest[max_recovered - 1]
+        if not math.isfinite(proven_lower):
+            proven_lower = 0.0
+        proven_lower = min(proven_lower, upper)
+        search_lower = proven_lower   # 二分探索はここから始める
         unserved_count = n_targets - max_recovered if allow_unserved else None
-        while upper - lower > deadline_step_min:
-            deadline = (lower + upper) / 2
+        while upper - search_lower > deadline_step_min:
+            deadline = (search_lower + upper) / 2
             routes, score, why = search(
                 deadline, unserved_count, f'段2（締切 D = {deadline:.1f} 分）', stop_when_found=True,
             )
@@ -217,9 +226,23 @@ def solve_hybrid(
             if why in ('TIME_LIMIT', 'ANNEALER_ERROR'):
                 stop_reason = why
                 break
-            lower = deadline       # 見つからない：もっと長い D を試す（無理の証明ではない）
+            # 見つからない：暫定の下限だけ D に上げて、もっと長い D を試す。
+            # 「D では無理」と証明できたわけではないので、証明済み下界（proven_lower）は上げない
+            search_lower = deadline
         else:
             stop_reason = 'DEADLINE_CONVERGED'
+
+    # 最適性の証明状態（最短と言えるのは、上の端と「証明済み」下界の差が刻み幅以下のときだけ）
+    if best is None:
+        optimality = 'NO_SOLUTION'
+    elif max_recovered == 0:
+        optimality = 'PROVEN' if not inst.targets else 'NOT_PROVEN'
+    elif upper is not None and proven_lower is not None and upper - proven_lower <= deadline_step_min:
+        optimality = 'PROVEN'
+    else:
+        optimality = 'NOT_PROVEN'
+    # 回復数の最大（N*）も、全部回復できたとき以外はアニーリングで見つけた数なので証明ではない
+    max_recovered_proven = best is not None and max_recovered == n_targets
 
     routes = best if best is not None else {}
     ev = evaluate(inst, routes)
@@ -231,8 +254,11 @@ def solve_hybrid(
             dp_states=stats['states'], unresolved=stats['unresolved'],
             stop_reason=stop_reason, has_solution=best is not None,
             max_recovered=max_recovered,
+            max_recovered_proven=max_recovered_proven,
             deadline_upper=None if upper is None else round(upper, 2),
-            deadline_lower=None if lower is None else round(lower, 2),
+            lower_bound_proven=None if proven_lower is None else round(proven_lower, 2),
+            lower_bound_search=None if search_lower is None else round(search_lower, 2),
+            optimality=optimality,
             deadline_history=history,
         )),
         seconds=round(time.monotonic() - started, 2),
