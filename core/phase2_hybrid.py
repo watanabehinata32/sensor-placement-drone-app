@@ -24,6 +24,7 @@ import time
 
 from .phase2_assignment import build_assignment_model, solve_assignment
 from .phase2_dp import TIME_EPSILON, solve_vehicle
+from .phase2_bounds import drive_is_shortest_path_closed
 from .phase2_maxflow import max_recovery
 from .routing import evaluate, route_times
 
@@ -229,9 +230,6 @@ def solve_hybrid(
         if score is not None:
             best, best_score = routes, score
             stop_reason = 'MAX_FLOW'
-            # 最大フローの数が「本当の最大」と言える条件（phase2_maxflow.py の前提）
-            max_recovered_proven = (single_sensor_flights and not deadlines and not return_deadlines
-                                    and not any(forbidden_transitions.values()))
         else:
             # 最大フローの担当が時刻表にできなかった（締切の指定などで前提が崩れた）とき：
             # アニーリングで「N* 基を回復する担当」を探し、それも無理なら回復数を決めずに探す
@@ -293,8 +291,16 @@ def solve_hybrid(
         optimality = 'PROVEN'
     else:
         optimality = 'NOT_PROVEN'
-    # 回復数の最大（N*）：最大フローの前提が成り立っていたか、全部回復できたなら「最大」と言える
-    max_recovered_proven = best is not None and (max_recovered_proven or max_recovered == n_targets)
+    # 回復数の最大（N*）が証明済みと言える条件
+    #   最大フローは「行きに走って行ける組なら担当できる」「担当できる数は飛べる回数 × 1 飛行の最大基数」という
+    #   ゆるめた（＝本当より有利な）条件で解いているので、その数は本当の最大の「上限」になる。
+    #   ただしこれは、走行時間の表が最短経路の表（三角不等式が成り立つ）のときだけ。そうでないと
+    #   「拠点から直接は行けないが、途中を経由すれば行ける」点を見落とし、上限にならないことがある。
+    #   実際に検証済みの計画がその上限と同じ数を回復できていれば、それが最大だと言える。
+    #   （帰着できない・離陸地点間を走れない・締切に間に合わない、といった理由で上限まで届かなければ未証明）
+    flow_is_upper_bound = max_recovered_by_flow is not None and drive_is_shortest_path_closed(inst.drive)
+    max_recovered_proven = best is not None and (
+        max_recovered == n_targets or (flow_is_upper_bound and max_recovered == max_recovered_by_flow))
 
     routes = best if best is not None else {}
     ev = evaluate(inst, routes)
