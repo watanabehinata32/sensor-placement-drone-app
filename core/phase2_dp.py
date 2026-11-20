@@ -30,6 +30,7 @@ def solve_vehicle(
     forbidden_transitions: Iterable[tuple[int, int]] = (),
     max_states: int | None = None,
     stop_at: float | None = None,
+    max_flights: int | None = None,
 ) -> VehicleResult:
     """Minimize the selected end time over routes that recover the assignment exactly once.
 
@@ -57,7 +58,9 @@ def solve_vehicle(
         status = 'FEASIBLE' if 0 <= return_limit else 'PROVEN_INFEASIBLE'
         return VehicleResult(status)
 
-    max_flights = min(inst.max_flights(), len(sensor_bits))
+    # 飛べる回数の上限。max_flights を渡せば、その数（予備バッテリーを積んだ車など）。渡さなければ内蔵の分だけ
+    flight_limit = inst.max_flights() if max_flights is None else max_flights
+    max_flights = min(flight_limit, len(sensor_bits))
     if max_flights <= 0:
         return VehicleResult('PROVEN_INFEASIBLE')
 

@@ -20,12 +20,26 @@ class AssignmentModel:
     statically_infeasible: bool
     unserved_count: int | None = None   # 未回収にする基数を決めたとき、その数（決めないなら None）
     last_report: dict = field(default_factory=dict)   # 直前の solve_assignment の記録（ログ用）
+    spare_capacity: dict = field(default_factory=dict)   # 予備を積むと増える担当の数 {車: 数}
+    spare_total: int = 0                                  # 予備バッテリーの個数（全体）
+    spare_variables: dict = field(default_factory=dict)  # 予備を積むかの変数 b[車]
+    max_unserved: int | None = None                       # 未回収を「この数以下」にするとき、その数
+
+    def spares_needed(self, assignment):
+        """担当から、予備バッテリーが要る車を求める（担当が予備なしの上限を超える車だけが予備を使う）.
+
+        予備は「飛べる回数」だけを増やすモデルなので、上限を超えない車に積んでも計画は変わらない。
+        だから担当が決まれば、意味のある予備の配分も決まる。
+        """
+        return frozenset(v for v, sensors in assignment.items() if len(sensors) > self.capacities.get(v, len(sensors)))
 
     def size(self):
         """QUBO の大きさ（ログ用）：担当の変数、補助変数（不等式のための変数）、二次の結合の数."""
         n_total = len(self.model.variables)
         n_quadratic = sum(1 for key in self.model.as_dict() if len(set(key)) == 2)
-        return dict(variables=len(self.pairs), auxiliary=n_total - len(self.pairs), quadratic=n_quadratic)
+        n_spare = len(self.spare_variables)
+        return dict(variables=len(self.pairs), spare_variables=n_spare,
+                    auxiliary=n_total - len(self.pairs) - n_spare, quadratic=n_quadratic)
 
     def violations(self, bits):
         """担当のビット列が、どの決まりを破っているかを日本語で返す（破っていなければ空）."""
@@ -49,8 +63,13 @@ class AssignmentModel:
         n_assigned = sum(len(sensors) for sensors in assigned.values())
         if self.unserved_count is not None and len(self.sensors) - n_assigned != self.unserved_count:
             reasons.append('未回収の数が、決めた数と違う')
-        if any(len(assigned.get(vehicle, ())) > limit for vehicle, limit in self.capacities.items()):
-            reasons.append('担当の数が上限を超える車がある')
+        if self.max_unserved is not None and len(self.sensors) - n_assigned > self.max_unserved:
+            reasons.append('未回収の数が、決めた上限を超える')
+        if any(len(assigned.get(vehicle, ())) > limit + self.spare_capacity.get(vehicle, 0)
+               for vehicle, limit in self.capacities.items()):
+            reasons.append('担当の数が、予備を積んでも上限を超える車がある')
+        if len(self.spares_needed(assigned)) > self.spare_total:
+            reasons.append('予備バッテリーが要る車が、予備の個数より多い')
         if any(assigned.get(vehicle, frozenset()) == failed_set for vehicle, failed_set in self.cuts):
             reasons.append('禁止制約（カット）に当たる担当がある')
         return reasons
@@ -85,9 +104,14 @@ class AssignmentModel:
         n_assigned = sum(len(sensors) for sensors in assigned.values())
         if self.unserved_count is not None and len(self.sensors) - n_assigned != self.unserved_count:
             return None
+        if self.max_unserved is not None and len(self.sensors) - n_assigned > self.max_unserved:
+            return None
+        # 担当の数：予備なしの上限を超える車は予備が要る。要る車が予備の個数以下で、予備込みの上限以内ならよい
         for vehicle, limit in self.capacities.items():
-            if len(assigned.get(vehicle, ())) > limit:
+            if len(assigned.get(vehicle, ())) > limit + self.spare_capacity.get(vehicle, 0):
                 return None
+        if len(self.spares_needed(assigned)) > self.spare_total:
+            return None
         for vehicle, failed_set in self.cuts:
             if assigned.get(vehicle, frozenset()) == failed_set:
                 return None
@@ -108,11 +132,17 @@ def _bounded_slack(generator, limit):
     return slack
 
 
-def build_assignment_model(eligible, costs, *, allow_unserved, cuts=(), capacities=None, unserved_count=None):
+def build_assignment_model(eligible, costs, *, allow_unserved, cuts=(), capacities=None, unserved_count=None,
+                           spare_capacity=None, spare_total=0, max_unserved=None):
     """担当変数と、任意の未回収変数・担当上限・完全一致カットを組み立てる。
 
     unserved_count … 締切 D の段で使う。「未回収はちょうど この数」という決まりを足す
     （一段目で見つけた最大の回復数を、二段目で減らさないようにするため）。
+    max_unserved   … 「未回収は この数以下」という決まり（N* が未証明のとき、もっと多く回復できる答えを残すため）
+    spare_capacity … 予備バッテリーを積むと増える担当の数 {車: 数}。ここにある車には変数 b[車]（積むなら 1）を作り、
+                     担当の上限を「予備なしの上限 ＋ 増える数 × b[車]」にする
+    spare_total    … 予備バッテリーの個数。「b の合計 ≤ この数」という決まりを足す
+    担当 x と予備 b を同じ QUBO で同時に決める（2026-11-20 ひなたさん指示）。
     """
     cuts = tuple(dict.fromkeys((vehicle, frozenset(sensors)) for vehicle, sensors in cuts))
     try:
@@ -154,12 +184,32 @@ def build_assignment_model(eligible, costs, *, allow_unserved, cuts=(), capaciti
     for total in totals.values():
         model += hard_weight * (total - 1) ** 2
 
+    # 予備バッテリーの変数 b[車]：予備の個数が 1 以上で、予備なしの上限より担当できるセンサーが多い車にだけ作る
+    #（担当できる数が上限以下の車は、予備を積んでも意味がないため）
+    spare_capacity = {v: int(extra) for v, extra in (spare_capacity or {}).items() if extra > 0}
+    spare_total = int(spare_total or 0)
+    spare_variables = {}
+    if spare_total > 0:
+        for vehicle in sorted(spare_capacity, key=str):
+            if len(by_vehicle.get(vehicle, {})) > capacities.get(vehicle, 0):
+                spare_variables[vehicle] = generator.array('Binary', 1)[0]
+
     for vehicle, limit in capacities.items():
         members = by_vehicle.get(vehicle, {})
         if len(members) <= limit:
             continue
         total = sum(members.values(), Poly())
-        model += hard_weight * (total + _bounded_slack(generator, limit) - limit) ** 2
+        if vehicle in spare_variables:
+            # 担当の数 ＋ 補助 ＝ 予備なしの上限 ＋ 増える数 × b   （補助は 0 〜 上限＋増える数）
+            extra = spare_capacity[vehicle]
+            model += hard_weight * (total + _bounded_slack(generator, limit + extra) - limit
+                                    - extra * spare_variables[vehicle]) ** 2
+        else:
+            model += hard_weight * (total + _bounded_slack(generator, limit) - limit) ** 2
+    # 予備の合計 ≤ 予備の個数
+    if len(spare_variables) > spare_total:
+        spare_sum = sum(spare_variables.values(), Poly())
+        model += hard_weight * (spare_sum + _bounded_slack(generator, spare_total) - spare_total) ** 2
 
     impossible = any(not options for options in choices.values())
 
@@ -174,6 +224,16 @@ def build_assignment_model(eligible, costs, *, allow_unserved, cuts=(), capaciti
         n_can_serve = sum(1 for options in choices.values() if any(v is not None for v in options))
         if n_can_serve < len(choices) - unserved_count:
             impossible = True
+    # 未回収の数を「max_unserved 以下」にする決まり（不等式なので補助変数を使う）
+    if allow_unserved and max_unserved is not None:
+        unserved_total = Poly()
+        n_marks = 0
+        for (sensor, vehicle), bit in zip(pairs, variables):
+            if vehicle is None:
+                unserved_total += bit
+                n_marks += 1
+        if n_marks > max_unserved:
+            model += hard_weight * (unserved_total + _bounded_slack(generator, max_unserved) - max_unserved) ** 2
     for vehicle, failed_set in cuts:
         members = by_vehicle.get(vehicle, {})
         if not failed_set.issubset(members):
@@ -189,7 +249,9 @@ def build_assignment_model(eligible, costs, *, allow_unserved, cuts=(), capaciti
 
     if not allow_unserved:
         unserved_count = None   # 未回収を許さないときは、もともと全部回復が決まりになっている
-    return AssignmentModel(model, variables, pairs, tuple(choices), cuts, capacities, impossible, unserved_count)
+    return AssignmentModel(model, variables, pairs, tuple(choices), cuts, capacities, impossible, unserved_count,
+                           spare_capacity=spare_capacity, spare_total=spare_total, spare_variables=spare_variables,
+                           max_unserved=max_unserved if allow_unserved else None)
 
 
 def solve_assignment(problem, client):

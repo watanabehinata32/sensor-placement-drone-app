@@ -325,6 +325,11 @@ def run_phase2(job_id, req):
                              'sensor_app/.env に AMPLIFY_TOKEN を書いてください）')
         cfg = Config()
         cfg.fleet = FleetSpec(charge_min=req.charge_min, flights_builtin=req.flights_builtin)
+        # 予備バッテリーの個数と、1 個で増える飛行回数は先方シナリオ（scenario.json）から読む（ハイブリッド方式だけが使う）。
+        # 1 台に積めるのは 0〜1 個として扱う（scenario.json の fleet.max_spare_batteries_per_vehicle = 1）
+        raw = SCENARIO['raw']
+        cfg.fleet.spare_total = int(raw.get('fleet', {}).get('total_spare_batteries', 0))
+        cfg.fleet.flights_per_spare = int(raw.get('dock', {}).get('charges_per_spare_battery', 0))
         job['stage'] = '① 前処理（走行時間と飛行の数え上げ）'
         pre = NETWORK.run(req.closed, req.down, req.bases)
 

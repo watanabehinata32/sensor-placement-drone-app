@@ -57,7 +57,9 @@ def solve_hybrid(
     # ・二分探索の下の端に使う
     eligible = {sensor: [] for sensor in inst.targets}
     earliest = {}
-    capacities = {}
+    capacities = {}          # 予備なしで担当できる数の上限 {車: 数}
+    spare_capacity = {}      # 予備を積むと増える担当の数 {車: 数}
+    spare_total = max(int(inst.cfg.fleet.spare_total), 0)   # 予備バッテリーの個数（全体）
     for vehicle in range(len(inst.vehicles)):
         max_sensors = 0
         for flight_index, flight in enumerate(inst.flights):
@@ -69,6 +71,8 @@ def solve_hybrid(
                 key = (sensor, vehicle)
                 earliest[key] = min(earliest.get(key, math.inf), launch + offset)
         capacities[vehicle] = inst.max_flights() * max_sensors
+        # 予備を積むと増える担当の数（1 飛行で max_sensors 基まで × 増える回数）
+        spare_capacity[vehicle] = (inst.max_flights(has_spare=True) - inst.max_flights()) * max_sensors
         for sensor in eligible:
             key = (sensor, vehicle)
             if key in earliest and capacities[vehicle]:
@@ -93,25 +97,79 @@ def solve_hybrid(
         """探索を始めてからの秒数."""
         return round(time.monotonic() - started, 4)
 
-    def run_dp(vehicle, sensors, sensor_limits, return_limit, record):
-        """solve_vehicle を呼び、かかった時間・状態数・遷移数を record と totals に足す."""
+    def run_dp(vehicle, sensors, sensor_limits, return_limit, record, has_spare=False, vehicle_log=None):
+        """solve_vehicle を呼び、かかった時間・状態数・遷移数を record と totals（と vehicle_log）に足す.
+
+        has_spare: 予備バッテリーを積むなら True（飛べる回数が増える）
+        """
         t0 = time.monotonic()
         result = solve_vehicle(
             inst, vehicle, sensors, deadlines=sensor_limits, return_deadline=return_limit,
             forbidden_transitions=forbidden_transitions.get(vehicle, ()), max_states=max_states, stop_at=stop_at,
+            max_flights=inst.max_flights(has_spare=has_spare),
         )
         seconds = time.monotonic() - t0
         for key, value in (('dp_calls', 1), ('dp_seconds', seconds), ('dp_states', result.states),
                            ('dp_transitions', result.transitions)):
             record[key] = record.get(key, 0) + value
             totals[key] += value
+            if vehicle_log is not None:
+                vehicle_log[key] = vehicle_log.get(key, 0) + value
         stats['states'] += result.states
         return result
 
-    def search(deadline, unserved_count, label, stop_when_found):
+    def schedule(assignment, sensor_limits, vehicle_limits, record):
+        """担当 {車: センサーの集合} を、車ごとの DP で時刻表にする（予備バッテリーの配分も決める）.
+
+        予備：担当が予備なしの上限を超える車に積む（予備は回数だけを増やすので、それ以外の車に積んでも意味がない）。
+        DP が「無理」と言ったら、理由を 2 つに分ける：
+          ・容量（バッテリー）不足 … 予備を積めば回れる。カットは作らない（容量の制約で扱う）
+          ・時間・道路の理由     … 予備を積んでも（飛べる回数を最大にしても）回れない。これだけをカットにする
+        戻り値: (routes {車: 飛行の並び} か None, spares 予備を積む車の集合, new_cuts [(車, 組)], vehicle_logs, 失敗の理由)
+        """
+        spares = set(v for v, sensors in assignment.items() if len(sensors) > capacities.get(v, len(sensors)))
+        routes, new_cuts, vehicle_logs, failure = {}, [], [], None
+        for vehicle, sensors in sorted(assignment.items()):
+            sensors = tuple(sorted(sensors))
+            vlog = dict(vehicle=inst.vehicles[vehicle].vehicle_id, assigned=len(sensors), spare=vehicle in spares)
+            vehicle_logs.append(vlog)
+            result = run_dp(vehicle, sensors, sensor_limits, vehicle_limits.get(vehicle), record,
+                            has_spare=vehicle in spares, vehicle_log=vlog)
+            if result.status == 'PROVEN_INFEASIBLE' and vehicle not in spares and spare_total > 0:
+                # 予備なしでは無理。予備を積めば（飛べる回数を最大にすれば）回れるかを調べて、理由を分ける
+                retry = run_dp(vehicle, sensors, sensor_limits, vehicle_limits.get(vehicle), record,
+                               has_spare=True, vehicle_log=vlog)
+                if retry.status == 'FEASIBLE':
+                    if len(spares) < spare_total:     # 予備が余っていれば積む
+                        spares.add(vehicle)
+                        vlog['spare'] = True
+                        result = retry
+                    else:
+                        vlog['status'] = 'CAPACITY'
+                        failure = failure or '予備バッテリーが足りない（容量不足。カットは作らない）'
+                        continue
+                else:
+                    result = retry
+            vlog['status'] = result.status
+            if result.status == 'PROVEN_INFEASIBLE':
+                # 飛べる回数を最大にしても無理 ＝ 時間・道路の理由 → この D ではカットにしてよい
+                new_cuts.append((vehicle, frozenset(sensors)))
+                failure = failure or 'DP で間に合わない車がある'
+            elif result.status == 'UNKNOWN':
+                stats['unresolved'] += 1
+                failure = failure or 'DP が時間・状態数の上限で止まった'
+            else:
+                routes[vehicle] = result.route
+        for vlog in vehicle_logs:
+            for key in ('dp_seconds',):
+                if key in vlog:
+                    vlog[key] = round(vlog[key], 6)
+        return (None if failure else routes), frozenset(spares), new_cuts, vehicle_logs, failure
+
+    def search(deadline, unserved_count, label, stop_when_found, max_unserved=None):
         """締切 deadline（None なら締切なし）で、割当 QUBO → 車ごとの DP をくり返す。
 
-        戻り値: (いちばん良い計画 {車: ルート} か None, その評価 (未回収数, 終了時刻) か None, 止まった理由)
+        戻り値: (いちばん良い計画 dict(routes, spares) か None, その評価 (未回収数, 終了時刻) か None, 止まった理由)
         """
         d_value = math.inf if deadline is None else deadline
         # センサーごとの回復の締切 = 指定された締切 と D の早いほう（「最後の回復」で測るとき）
@@ -145,7 +203,8 @@ def solve_hybrid(
             )
             problem = build_assignment_model(
                 usable, costs, allow_unserved=allow_unserved, cuts=active_cuts,
-                capacities=capacities, unserved_count=unserved_count,
+                capacities=capacities, unserved_count=unserved_count, max_unserved=max_unserved,
+                spare_capacity=spare_capacity, spare_total=spare_total,
             )
             stats['variables'] = len(problem.pairs)
             if problem.statically_infeasible:
@@ -193,41 +252,32 @@ def solve_hybrid(
                     continue
                 seen.add(key)
 
-                # 車ごとに、決まった担当を回るいちばん早い順番を DP で求める
-                routes = {}
-                all_scheduled = True
-                statuses = []
-                for vehicle, sensors in key:
-                    result = run_dp(vehicle, sensors, sensor_limits, vehicle_limits.get(vehicle), record)
-                    statuses.append(result.status)
-                    if result.status == 'PROVEN_INFEASIBLE':
-                        # この車にこの担当の組は、この D では無理 → 次の QUBO で選べないようにする
-                        cuts.append((vehicle, frozenset(sensors), d_value))
-                        new_cut = True
-                    elif result.status == 'UNKNOWN':
-                        stats['unresolved'] += 1
-                    else:
-                        routes[vehicle] = result.route
-                    all_scheduled &= result.status == 'FEASIBLE'
-                if not all_scheduled:
-                    reason = 'DP で間に合わない車がある' if 'PROVEN_INFEASIBLE' in statuses else 'DP が時間・状態数の上限で止まった'
-                    record['candidates'].append(dict(status=reason, end=None))   # 実際の時刻は出ていない
+                # 車ごとに、決まった担当を回るいちばん早い順番を DP で求める（予備の配分もここで決まる）
+                routes, spares, new_cuts, vehicle_logs, failure = schedule(
+                    assignment, sensor_limits, vehicle_limits, record)
+                for vehicle, sensors in new_cuts:
+                    # この車にこの担当の組は、この D では（予備を積んでも）無理 → 次の QUBO で選べないようにする
+                    cuts.append((vehicle, sensors, d_value))
+                    new_cut = True
+                if routes is None:
+                    record['candidates'].append(dict(status=failure, end=None, vehicles=vehicle_logs))
                     continue
 
                 score = _validate_routes(
                     inst, routes, assignment, sensor_limits, vehicle_limits,
-                    forbidden_assignments, forbidden_transitions, allow_unserved,
+                    forbidden_assignments, forbidden_transitions, allow_unserved, spares,
                 )
                 if score is None:
-                    record['candidates'].append(dict(status='独立検証で不合格', end=None))
+                    record['candidates'].append(dict(status='独立検証で不合格', end=None, vehicles=vehicle_logs))
                     continue
-                record['candidates'].append(dict(status='検証済み', end=round(score[1], 4), unserved=score[0]))
+                record['candidates'].append(dict(status='検証済み', end=round(score[1], 4), unserved=score[0],
+                                                 vehicles=vehicle_logs))
                 if best_score is None or score < best_score:
-                    best_routes, best_score = routes, score
+                    best_routes, best_score = dict(routes=routes, spares=spares), score
 
             # この反復が終わった時点の「最良の最後の回復時刻」と経過時間
             if best_score is not None and (now_state['best_end'] is None or best_score[1] < now_state['best_end']) \
-                    and (unserved_count is None or best_score[0] == unserved_count):
+                    and deadline is not None:
                 now_state['best_end'] = round(best_score[1], 4)
             record.update(best_end=now_state['best_end'], elapsed_seconds=elapsed())
             if best_routes is not None and stop_when_found:
@@ -240,7 +290,7 @@ def solve_hybrid(
     # ---- 段1：締切なしで、回復できる最大の数を求める --------------------------------
     # 何も回らない計画（全部未回収）は、未回収を許すときだけ「計画あり」とみなす
     empty_ok = (allow_unserved or not inst.targets) and all(d >= 0 for d in return_deadlines.values())
-    best = {} if empty_ok else None
+    best = dict(routes={}, spares=frozenset()) if empty_ok else None
     best_score = (n_targets, 0.0)
     stop_reason = 'NO_TARGETS'
     history = []
@@ -261,31 +311,33 @@ def solve_hybrid(
         # 1 回の飛行で 1 基なら「担当できる数 ＝ 飛べる回数」。そうでなければ capacities（大きめの上限）を使う
         base_capacity = {v: (inst.max_flights() if single_sensor_flights else capacities[v])
                          for v in range(len(inst.vehicles))}
-        flow = max_recovery(flow_eligible, base_capacity,
+        # 予備バッテリーの配分も含めて最大を求める（予備を積む車の選び方を全部試す。phase2_maxflow.py）。
+        # 1 飛行 1 基でないときの「増える数」は車ごとに違いうるので、いちばん大きい値を使う（上限としては正しい）
+        flow = max_recovery(flow_eligible, base_capacity, spare_total=spare_total,
+                            capacity_per_spare=(inst.max_flights(has_spare=True) - inst.max_flights()
+                                                if single_sensor_flights else max(spare_capacity.values(), default=0)),
                             vehicle_group={v: veh.base_id for v, veh in enumerate(inst.vehicles)})
         max_recovered_by_flow = flow['count']
         # 段1-b：最大フローの担当を DP で時刻表にする（初めの実行可能な計画と、上の端）
-        routes = {}
-        flow_ok = True
+        # 段1で決めた予備の配分は「初めの計画」にだけ使う。段2では固定せず、アニーリングが担当と一緒に決め直す
         flow_record = dict(iteration=0, stage='段1 最大フロー', deadline=None, max_recovered_by_flow=flow['count'],
-                           spare_allocations_tried=flow['allocations_tried'], candidates=[],
+                           spare_allocations_tried=flow['allocations_tried'], spares_by_flow=sorted(
+                               inst.vehicles[v].vehicle_id for v in flow['spares']), candidates=[],
                            dp_calls=0, dp_seconds=0.0, dp_states=0, dp_transitions=0, cache_hits=None)
         iteration_log.append(flow_record)
-        for vehicle, sensors in sorted(flow['assignment'].items()):
-            result = run_dp(vehicle, sorted(sensors), dict(deadlines), return_deadlines.get(vehicle), flow_record)
-            if result.status != 'FEASIBLE':
-                flow_ok = False
-                break
-            routes[vehicle] = result.route
+        routes, spares, _, vehicle_logs, failure = schedule(flow['assignment'], dict(deadlines),
+                                                            dict(return_deadlines), flow_record)
         score = None
-        if flow_ok:
+        if routes is not None:
             score = _validate_routes(inst, routes, flow['assignment'], deadlines, return_deadlines,
-                                     forbidden_assignments, forbidden_transitions, allow_unserved)
+                                     forbidden_assignments, forbidden_transitions, allow_unserved, spares)
         flow_record['candidates'].append(
-            dict(status='検証済み', end=round(score[1], 4), unserved=score[0]) if score is not None
-            else dict(status='最大フローの担当を時刻表にできない', end=None))
+            dict(status='検証済み', end=round(score[1], 4), unserved=score[0], vehicles=vehicle_logs)
+            if score is not None
+            else dict(status=f'最大フローの担当を時刻表にできない（{failure or "独立検証で不合格"}）', end=None,
+                      vehicles=vehicle_logs))
         if score is not None:
-            best, best_score = routes, score
+            best, best_score = dict(routes=routes, spares=spares), score
             stop_reason = 'MAX_FLOW'
             now_state['best_end'] = round(score[1], 4)
             flow_record.update(best_end=now_state['best_end'], elapsed_seconds=elapsed())
@@ -304,7 +356,27 @@ def solve_hybrid(
                 raise RuntimeError('割当 QUBO を解けませんでした')
         max_recovered = n_targets - best_score[0]
 
+    # N* が証明済みか（段2で「回復数をちょうど N*」に固定してよいか）を、ここで判断しておく
+    flow_is_upper_bound = max_recovered_by_flow is not None and drive_is_shortest_path_closed(inst.drive)
+    n_star_proven = best is not None and (
+        max_recovered == n_targets or (flow_is_upper_bound and max_recovered == max_recovered_by_flow))
+
+    # N* が未証明なら、段2に入る前に「もっと多く回復できる担当」を、時間の締切なしで探しておく
+    #（見つかれば N* を 1 つずつ上げる。アニーリングで見つからなくても「無理」とは言わない）
+    while best is not None and not n_star_proven and allow_unserved and max_recovered < n_targets \
+            and stop_reason not in ('TIME_LIMIT', 'ANNEALER_ERROR'):
+        plan, score, why = search(None, None, f'段1（{max_recovered + 1} 基以上を回復できるか）',
+                                  stop_when_found=True, max_unserved=n_targets - max_recovered - 1)
+        if plan is None or score[0] >= best_score[0]:
+            if why in ('TIME_LIMIT', 'ANNEALER_ERROR'):
+                stop_reason = why
+            break
+        best, best_score = plan, score
+        max_recovered = n_targets - score[0]
+        n_star_proven = max_recovered == n_targets or (flow_is_upper_bound and max_recovered == max_recovered_by_flow)
+
     # ---- 段2：回復数 N* のまま、締切 D を二分探索して最後の時刻を縮める ------------------
+    # N* が未証明なら、回復数は「N* 以上」にして、もっと多く回復できる答えも残す（見つかったら N* を上げる）
     upper = None
     proven_lower = None      # 証明済み下界（計算で言える「これより早くは無理」）
     search_lower = None      # 探索上の暫定下限（二分探索の下の端。証明ではない）
@@ -323,12 +395,33 @@ def solve_hybrid(
         search_lower = proven_lower   # 二分探索はここから始める
         now_state.update(proven_lower=round(proven_lower, 4), search_lower=round(search_lower, 4),
                          best_end=round(upper, 4))
-        unserved_count = n_targets - max_recovered if allow_unserved else None
+        def fix_or_cap():
+            """段2の QUBO に渡す「未回収の数」の決まり：(ちょうどの数, 上限)."""
+            if not allow_unserved:
+                return None, None
+            if n_star_proven:
+                return n_targets - max_recovered, None          # 証明済み：ちょうど N* 基
+            return None, n_targets - max_recovered              # 未証明：N* 基以上（未回収はこの数以下）
+
         while upper - search_lower > deadline_step_min:
             deadline = (search_lower + upper) / 2
+            exact_unserved, cap_unserved = fix_or_cap()
             routes, score, why = search(
-                deadline, unserved_count, f'段2（締切 D = {deadline:.1f} 分）', stop_when_found=True,
+                deadline, exact_unserved, f'段2（締切 D = {deadline:.1f} 分）', stop_when_found=True,
+                max_unserved=cap_unserved,
             )
+            if routes is not None and score[0] < best_score[0]:
+                # N* より多く回復できる計画が見つかった（N* が未証明だったとき）→ N* を上げて探し直す
+                best, best_score = routes, score
+                max_recovered = n_targets - score[0]
+                upper = score[1]
+                proven_lower = min(fastest[max_recovered - 1], upper) if math.isfinite(fastest[max_recovered - 1]) else 0.0
+                search_lower = proven_lower
+                now_state.update(proven_lower=round(proven_lower, 4), search_lower=round(search_lower, 4),
+                                 best_end=round(upper, 4))
+                history.append(dict(deadline=round(deadline, 2), found=True, end=round(score[1], 2),
+                                    more_recovered=max_recovered))
+                continue
             if routes is not None and score[0] == best_score[0]:
                 best, best_score = routes, score
                 upper = score[1]   # 見つかった：実際の終了時刻まで上の端を下げる
@@ -362,12 +455,12 @@ def solve_hybrid(
     #   「拠点から直接は行けないが、途中を経由すれば行ける」点を見落とし、上限にならないことがある。
     #   実際に検証済みの計画がその上限と同じ数を回復できていれば、それが最大だと言える。
     #   （帰着できない・離陸地点間を走れない・締切に間に合わない、といった理由で上限まで届かなければ未証明）
-    flow_is_upper_bound = max_recovered_by_flow is not None and drive_is_shortest_path_closed(inst.drive)
     max_recovered_proven = best is not None and (
         max_recovered == n_targets or (flow_is_upper_bound and max_recovered == max_recovered_by_flow))
 
-    routes = best if best is not None else {}
-    ev = evaluate(inst, routes)
+    routes = best['routes'] if best is not None else {}
+    spares = best['spares'] if best is not None else frozenset()
+    ev = evaluate(inst, routes, spares=spares)
     return dict(
         inst=inst, routes=routes, eval=ev, missing=ev['missing'], violations=[],
         steps=dict(hybrid=dict(
@@ -378,6 +471,10 @@ def solve_hybrid(
             max_recovered=max_recovered,
             max_recovered_proven=max_recovered_proven,
             max_recovered_by_flow=max_recovered_by_flow,
+            spare_total=spare_total,
+            cut_list=[dict(vehicle=inst.vehicles[v].vehicle_id, sensors=sorted(c),
+                           deadline=None if not math.isfinite(at) else round(at, 4)) for v, c, at in cuts],
+            spares=sorted(inst.vehicles[v].vehicle_id for v in spares),
             deadline_upper=None if upper is None else round(upper, 2),
             lower_bound_proven=None if proven_lower is None else round(proven_lower, 2),
             lower_bound_search=None if search_lower is None else round(search_lower, 2),
@@ -397,19 +494,21 @@ def solve_hybrid(
 
 def _validate_routes(
     inst, routes, assignment, deadlines, return_deadlines,
-    forbidden_assignments, forbidden_transitions, allow_unserved,
+    forbidden_assignments, forbidden_transitions, allow_unserved, spares=frozenset(),
 ):
     """Recompute the schedule from restored flight indices and score valid plans."""
     if routes.keys() != assignment.keys():
         return None
     if any(vehicle not in routes and deadline < 0 for vehicle, deadline in return_deadlines.items()):
         return None
+    if len(set(spares)) > max(int(inst.cfg.fleet.spare_total), 0):
+        return None               # 予備を、ある数より多く積んでいる
     recovered = set()
     end_time = 0.0
     for vehicle, route in routes.items():
         launches, end_recovery, end_return = route_times(inst, vehicle, route)
         end = end_return if inst.end_mode == 'return' else end_recovery
-        if not math.isfinite(end) or not math.isfinite(end_return) or len(route) > inst.max_flights():
+        if not math.isfinite(end) or not math.isfinite(end_return) or len(route) > inst.max_flights(vehicle in spares):
             return None
         if end_return > return_deadlines.get(vehicle, math.inf) + TIME_EPSILON:
             return None
