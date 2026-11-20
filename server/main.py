@@ -10,7 +10,8 @@
   （開いている人ごとに状態が混ざらず、作りも簡単になるため）。
 - 覚えておくのは、起動時に 1 回だけ読むデータ（道路網など）と、二段階目の計算の進み具合だけ。
 - ソルバーは Amplify AE。トークンは .env（環境変数 AMPLIFY_TOKEN）から読み、画面にもログにも出さない。
-  トークンがないときは、一段階目をタブーサーチ、二段階目のハイブリッド方式を焼きなまし法で試せる。
+  一段階目だけは、トークンがないとき確認用に手元のタブーサーチで解く（画面に「確認用」と出す）。
+  二段階目は Amplify だけで解く（列挙方式もハイブリッド方式も。トークンがなければ、その旨を画面に出して止める）。
 """
 import json
 import math
@@ -301,9 +302,8 @@ def run_hybrid(pre, cfg, req, token, progress):
         raise ValueError('締切には有限の分数を指定してください')
 
     def client_factory(iteration, remaining):
-        if token:
-            return make_amplify_client(token, max(1, min(req.time_limit_ms, int(remaining * 1000))))
-        return LocalSAClient(sweeps=80, seed=iteration - 1)
+        # 割当 QUBO は毎回 Amplify AE で解く（残り時間が少ないときは、その分だけ短くする）
+        return make_amplify_client(token, max(1, min(req.time_limit_ms, int(remaining * 1000))))
 
     out = solve_hybrid(
         inst, client_factory, allow_unserved=req.allow_unserved, deadlines=req.recovery_deadlines,
@@ -311,7 +311,7 @@ def run_hybrid(pre, cfg, req, token, progress):
         forbidden_assignments={(sensor, vehicle_indices[vehicle]) for sensor, vehicle in req.forbidden_assignments},
         progress=progress,
     )
-    out['solver'] = 'Amplify AE + 車両別DP' if token else '手元の焼きなまし法 + 車両別DP'
+    out['solver'] = 'Amplify AE + 車両別DP'
     return out
 
 
@@ -320,7 +320,7 @@ def run_phase2(job_id, req):
     job = JOBS[job_id]
     try:
         token = amplify_token()
-        if req.method == 'enumeration' and not token:
+        if not token:
             raise ValueError('Amplify のトークンが設定されていません（二段階目は Amplify だけで解きます。'
                              'sensor_app/.env に AMPLIFY_TOKEN を書いてください）')
         cfg = Config()
