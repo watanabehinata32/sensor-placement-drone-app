@@ -17,6 +17,7 @@ class VehicleResult:
     status: str
     route: tuple[int, ...] = ()
     states: int = 0
+    transitions: int = 0   # 調べた遷移（「この状態から次にこの飛行」）の数。ログ用
 
 
 def solve_vehicle(
@@ -88,6 +89,7 @@ def solve_vehicle(
     # improve the remaining options. Separate layers preserve the battery budget.
     layer = {(0, None): (0.0, ())}
     states = 0
+    transitions = 0
     best_route = ()
     best_end = inf
     for _ in range(max_flights):
@@ -97,9 +99,10 @@ def solve_vehicle(
                 continue
             for flight_index, mask, recovery_limits in pool:
                 if time_expired():
-                    return VehicleResult('UNKNOWN', states=states)
+                    return VehicleResult('UNKNOWN', states=states, transitions=transitions)
                 if covered & mask or (last, flight_index) in forbidden:
                     continue
+                transitions += 1
                 next_launch = (
                     inst.drive_from_base(vehicle, flight_index)
                     if last is None else launch + inst.gap(last, flight_index)
@@ -116,7 +119,7 @@ def solve_vehicle(
                     continue
                 if previous is None:
                     if max_states is not None and states == max_states:
-                        return VehicleResult('UNKNOWN', states=states)
+                        return VehicleResult('UNKNOWN', states=states, transitions=transitions)
                     states += 1
                 next_route = route + (flight_index,)
                 next_layer[key] = (next_launch, next_route)
@@ -135,7 +138,7 @@ def solve_vehicle(
         layer = next_layer
 
     if time_expired():
-        return VehicleResult('UNKNOWN', states=states)
+        return VehicleResult('UNKNOWN', states=states, transitions=transitions)
     if best_route:
-        return VehicleResult('FEASIBLE', best_route, states)
-    return VehicleResult('PROVEN_INFEASIBLE', states=states)
+        return VehicleResult('FEASIBLE', best_route, states, transitions)
+    return VehicleResult('PROVEN_INFEASIBLE', states=states, transitions=transitions)

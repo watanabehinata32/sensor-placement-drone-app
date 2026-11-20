@@ -82,6 +82,32 @@ def solve_hybrid(
     cuts = []            # (車, 担当の組, そのときの D)。D 以下の締切ならいつでも「無理」のまま使える
     stats = dict(iterations=0, states=0, variables=0, unresolved=0)
 
+    # ---- 探索のログ（性能検証と、問題が起きたときの原因探し用。2026-11-20 ひなたさん依頼）----
+    # 1 回の「割当 QUBO → 車ごとの DP」ごとに 1 行（dict）を iteration_log に足す。
+    # 段1の最大フローも 1 行として残す。結果の steps.hybrid.iteration_log で取り出せる。
+    iteration_log = []
+    now_state = dict(proven_lower=None, search_lower=None, best_end=None)   # 外側（段1・段2）が書き換える
+    totals = dict(anneal_calls=0, anneal_seconds=0.0, dp_calls=0, dp_seconds=0.0, dp_states=0, dp_transitions=0)
+
+    def elapsed():
+        """探索を始めてからの秒数."""
+        return round(time.monotonic() - started, 4)
+
+    def run_dp(vehicle, sensors, sensor_limits, return_limit, record):
+        """solve_vehicle を呼び、かかった時間・状態数・遷移数を record と totals に足す."""
+        t0 = time.monotonic()
+        result = solve_vehicle(
+            inst, vehicle, sensors, deadlines=sensor_limits, return_deadline=return_limit,
+            forbidden_transitions=forbidden_transitions.get(vehicle, ()), max_states=max_states, stop_at=stop_at,
+        )
+        seconds = time.monotonic() - t0
+        for key, value in (('dp_calls', 1), ('dp_seconds', seconds), ('dp_states', result.states),
+                           ('dp_transitions', result.transitions)):
+            record[key] = record.get(key, 0) + value
+            totals[key] += value
+        stats['states'] += result.states
+        return result
+
     def search(deadline, unserved_count, label, stop_when_found):
         """締切 deadline（None なら締切なし）で、割当 QUBO → 車ごとの DP をくり返す。
 
@@ -130,10 +156,32 @@ def solve_hybrid(
             stats['iterations'] += 1
             if progress:
                 progress(f'{label}：割当 QUBO と車両別 DP（通算 {stats["iterations"]} 回目）')
+            record = dict(
+                iteration=stats['iterations'], stage=label,
+                deadline=None if deadline is None else round(deadline, 4),
+                lower_bound_proven=now_state['proven_lower'], lower_bound_search=now_state['search_lower'],
+                cuts_total=len({(v, c) for v, c, _ in cuts}), cuts_active=len(active_cuts),
+                qubo=problem.size(), candidates=[], dp_calls=0, dp_seconds=0.0, dp_states=0, dp_transitions=0,
+                cache_hits=None,   # キャッシュはまだ作っていない（v0.3 で入れたら数を入れる）
+            )
+            iteration_log.append(record)
+            t0 = time.monotonic()
+            totals['anneal_calls'] += 1
             try:
                 assignments = solve_assignment(problem, client_factory(stats['iterations'], remaining))
-            except RuntimeError:
+            except RuntimeError as error:
+                record.update(anneal_seconds=round(time.monotonic() - t0, 4), anneal_error=str(error),
+                              elapsed_seconds=elapsed())
+                totals['anneal_seconds'] += time.monotonic() - t0
                 return best_routes, best_score, 'ANNEALER_ERROR'
+            anneal_seconds = time.monotonic() - t0
+            totals['anneal_seconds'] += anneal_seconds
+            report = problem.last_report or {}
+            record.update(
+                anneal_seconds=round(anneal_seconds, 4), anneal_calls_total=totals['anneal_calls'],
+                solutions_returned=report.get('solutions'), solutions_valid=report.get('valid'),
+                violations=dict(report.get('violations', {})),   # 決まりを破った解の、破った内容ごとの数
+            )
 
             new_cut = False
             for assignment in assignments:
@@ -141,20 +189,17 @@ def solve_hybrid(
                     break
                 key = tuple((v, tuple(sorted(sensors))) for v, sensors in sorted(assignment.items()))
                 if key in seen:
+                    record['candidates'].append(dict(status='前と同じ担当', end=None))
                     continue
                 seen.add(key)
 
                 # 車ごとに、決まった担当を回るいちばん早い順番を DP で求める
                 routes = {}
                 all_scheduled = True
+                statuses = []
                 for vehicle, sensors in key:
-                    result = solve_vehicle(
-                        inst, vehicle, sensors, deadlines=sensor_limits,
-                        return_deadline=vehicle_limits.get(vehicle),
-                        forbidden_transitions=forbidden_transitions.get(vehicle, ()),
-                        max_states=max_states, stop_at=stop_at,
-                    )
-                    stats['states'] += result.states
+                    result = run_dp(vehicle, sensors, sensor_limits, vehicle_limits.get(vehicle), record)
+                    statuses.append(result.status)
                     if result.status == 'PROVEN_INFEASIBLE':
                         # この車にこの担当の組は、この D では無理 → 次の QUBO で選べないようにする
                         cuts.append((vehicle, frozenset(sensors), d_value))
@@ -165,15 +210,26 @@ def solve_hybrid(
                         routes[vehicle] = result.route
                     all_scheduled &= result.status == 'FEASIBLE'
                 if not all_scheduled:
+                    reason = 'DP で間に合わない車がある' if 'PROVEN_INFEASIBLE' in statuses else 'DP が時間・状態数の上限で止まった'
+                    record['candidates'].append(dict(status=reason, end=None))   # 実際の時刻は出ていない
                     continue
 
                 score = _validate_routes(
                     inst, routes, assignment, sensor_limits, vehicle_limits,
                     forbidden_assignments, forbidden_transitions, allow_unserved,
                 )
-                if score is not None and (best_score is None or score < best_score):
+                if score is None:
+                    record['candidates'].append(dict(status='独立検証で不合格', end=None))
+                    continue
+                record['candidates'].append(dict(status='検証済み', end=round(score[1], 4), unserved=score[0]))
+                if best_score is None or score < best_score:
                     best_routes, best_score = routes, score
 
+            # この反復が終わった時点の「最良の最後の回復時刻」と経過時間
+            if best_score is not None and (now_state['best_end'] is None or best_score[1] < now_state['best_end']) \
+                    and (unserved_count is None or best_score[0] == unserved_count):
+                now_state['best_end'] = round(best_score[1], 4)
+            record.update(best_end=now_state['best_end'], elapsed_seconds=elapsed())
             if best_routes is not None and stop_when_found:
                 return best_routes, best_score, 'FOUND'
             if not new_cut:
@@ -211,14 +267,12 @@ def solve_hybrid(
         # 段1-b：最大フローの担当を DP で時刻表にする（初めの実行可能な計画と、上の端）
         routes = {}
         flow_ok = True
+        flow_record = dict(iteration=0, stage='段1 最大フロー', deadline=None, max_recovered_by_flow=flow['count'],
+                           spare_allocations_tried=flow['allocations_tried'], candidates=[],
+                           dp_calls=0, dp_seconds=0.0, dp_states=0, dp_transitions=0, cache_hits=None)
+        iteration_log.append(flow_record)
         for vehicle, sensors in sorted(flow['assignment'].items()):
-            result = solve_vehicle(
-                inst, vehicle, sorted(sensors), deadlines=dict(deadlines),
-                return_deadline=return_deadlines.get(vehicle),
-                forbidden_transitions=forbidden_transitions.get(vehicle, ()),
-                max_states=max_states, stop_at=stop_at,
-            )
-            stats['states'] += result.states
+            result = run_dp(vehicle, sorted(sensors), dict(deadlines), return_deadlines.get(vehicle), flow_record)
             if result.status != 'FEASIBLE':
                 flow_ok = False
                 break
@@ -227,10 +281,16 @@ def solve_hybrid(
         if flow_ok:
             score = _validate_routes(inst, routes, flow['assignment'], deadlines, return_deadlines,
                                      forbidden_assignments, forbidden_transitions, allow_unserved)
+        flow_record['candidates'].append(
+            dict(status='検証済み', end=round(score[1], 4), unserved=score[0]) if score is not None
+            else dict(status='最大フローの担当を時刻表にできない', end=None))
         if score is not None:
             best, best_score = routes, score
             stop_reason = 'MAX_FLOW'
+            now_state['best_end'] = round(score[1], 4)
+            flow_record.update(best_end=now_state['best_end'], elapsed_seconds=elapsed())
         else:
+            flow_record.update(best_end=None, elapsed_seconds=elapsed())
             # 最大フローの担当が時刻表にできなかった（締切の指定などで前提が崩れた）とき：
             # アニーリングで「N* 基を回復する担当」を探し、それも無理なら回復数を決めずに探す
             unserved = n_targets - max_recovered_by_flow
@@ -261,6 +321,8 @@ def solve_hybrid(
             proven_lower = 0.0
         proven_lower = min(proven_lower, upper)
         search_lower = proven_lower   # 二分探索はここから始める
+        now_state.update(proven_lower=round(proven_lower, 4), search_lower=round(search_lower, 4),
+                         best_end=round(upper, 4))
         unserved_count = n_targets - max_recovered if allow_unserved else None
         while upper - search_lower > deadline_step_min:
             deadline = (search_lower + upper) / 2
@@ -270,6 +332,7 @@ def solve_hybrid(
             if routes is not None and score[0] == best_score[0]:
                 best, best_score = routes, score
                 upper = score[1]   # 見つかった：実際の終了時刻まで上の端を下げる
+                now_state['best_end'] = round(upper, 4)
                 history.append(dict(deadline=round(deadline, 2), found=True, end=round(score[1], 2)))
                 continue
             history.append(dict(deadline=round(deadline, 2), found=False, reason=why))
@@ -279,6 +342,7 @@ def solve_hybrid(
             # 見つからない：暫定の下限だけ D に上げて、もっと長い D を試す。
             # 「D では無理」と証明できたわけではないので、証明済み下界（proven_lower）は上げない
             search_lower = deadline
+            now_state['search_lower'] = round(search_lower, 4)
         else:
             stop_reason = 'DEADLINE_CONVERGED'
 
@@ -318,6 +382,13 @@ def solve_hybrid(
             lower_bound_proven=None if proven_lower is None else round(proven_lower, 2),
             lower_bound_search=None if search_lower is None else round(search_lower, 2),
             optimality=optimality,
+            iteration_log=iteration_log,
+            totals=dict(
+                anneal_calls=totals['anneal_calls'], anneal_seconds=round(totals['anneal_seconds'], 4),
+                dp_calls=totals['dp_calls'], dp_seconds=round(totals['dp_seconds'], 4),
+                dp_states=totals['dp_states'], dp_transitions=totals['dp_transitions'],
+                cuts=len({(v, c) for v, c, _ in cuts}), cache_hits=None, elapsed_seconds=elapsed(),
+            ),
             deadline_history=history,
         )),
         seconds=round(time.monotonic() - started, 2),

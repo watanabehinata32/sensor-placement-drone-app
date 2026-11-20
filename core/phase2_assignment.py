@@ -1,6 +1,7 @@
 """Phase 2 の担当割当QUBOと、サンプルの検証。"""
 
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from math import fsum, isfinite
 from operator import index
 
@@ -18,6 +19,41 @@ class AssignmentModel:
     capacities: dict
     statically_infeasible: bool
     unserved_count: int | None = None   # 未回収にする基数を決めたとき、その数（決めないなら None）
+    last_report: dict = field(default_factory=dict)   # 直前の solve_assignment の記録（ログ用）
+
+    def size(self):
+        """QUBO の大きさ（ログ用）：担当の変数、補助変数（不等式のための変数）、二次の結合の数."""
+        n_total = len(self.model.variables)
+        n_quadratic = sum(1 for key in self.model.as_dict() if len(set(key)) == 2)
+        return dict(variables=len(self.pairs), auxiliary=n_total - len(self.pairs), quadratic=n_quadratic)
+
+    def violations(self, bits):
+        """担当のビット列が、どの決まりを破っているかを日本語で返す（破っていなければ空）."""
+        bits = np.asarray(bits, dtype=float)
+        rounded = np.rint(bits)
+        if self.statically_infeasible:
+            return ['どの担当も選べない問題になっている']
+        if (bits.shape != (len(self.pairs),) or not np.allclose(bits, rounded, rtol=0, atol=1e-6)
+                or not np.isin(rounded, (0, 1)).all()):
+            return ['変数が 0 か 1 になっていない']
+        reasons = []
+        chosen_count = Counter()
+        assigned = {}
+        for (sensor, vehicle), chosen in zip(self.pairs, rounded):
+            if chosen:
+                chosen_count[sensor] += 1
+                if vehicle is not None:
+                    assigned.setdefault(vehicle, set()).add(sensor)
+        if any(chosen_count[sensor] != 1 for sensor in self.sensors):
+            reasons.append('担当（か未回収の印）がちょうど 1 つでないセンサーがある')
+        n_assigned = sum(len(sensors) for sensors in assigned.values())
+        if self.unserved_count is not None and len(self.sensors) - n_assigned != self.unserved_count:
+            reasons.append('未回収の数が、決めた数と違う')
+        if any(len(assigned.get(vehicle, ())) > limit for vehicle, limit in self.capacities.items()):
+            reasons.append('担当の数が上限を超える車がある')
+        if any(assigned.get(vehicle, frozenset()) == failed_set for vehicle, failed_set in self.cuts):
+            reasons.append('禁止制約（カット）に当たる担当がある')
+        return reasons
 
     def decode(self, values):
         """エネルギー計算に現れない変数は0として、担当だけを読み出す。"""
@@ -166,10 +202,15 @@ def solve_assignment(problem, client):
 
     assignments = []
     seen = set()
+    report = dict(solutions=0, valid=0, violations=Counter())   # ログ用：返ってきた解の数と、破った決まり
+    problem.last_report = report
     for solution in solve(problem.model, client, filter_solution=False):
+        report['solutions'] += 1
         assignment = problem.decode(solution.values)
         if assignment is None:
+            report['violations'].update(problem.violations(problem.variables.evaluate(solution.values, 0)))
             continue
+        report['valid'] += 1
         key = frozenset(assignment.items())
         if key not in seen:
             assignments.append(assignment)
