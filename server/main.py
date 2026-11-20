@@ -10,26 +10,30 @@
   （開いている人ごとに状態が混ざらず、作りも簡単になるため）。
 - 覚えておくのは、起動時に 1 回だけ読むデータ（道路網など）と、二段階目の計算の進み具合だけ。
 - ソルバーは Amplify AE。トークンは .env（環境変数 AMPLIFY_TOKEN）から読み、画面にもログにも出さない。
-  一段階目だけは、トークンがないとき確認用に手元のタブーサーチで解く（画面に「確認用」と出す）。
-  二段階目は Amplify だけで解く（トークンがなければ、その旨を画面に出して止める）。
+  トークンがないときは、一段階目をタブーサーチ、二段階目のハイブリッド方式を焼きなまし法で試せる。
 """
 import json
+import math
 import os
 import threading
 import time
 import uuid
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, NonNegativeFloat
 
 from core import phase1
 from core.config import Config, FleetSpec
 from core.damage import make_damage
 from core.data_io import load_roads, load_scenario, load_sensors
+from core.local_client import LocalSAClient
 from core.phase2 import solve_phase2 as solve_phase2_steps
+from core.phase2_hybrid import solve_hybrid
 from core.preprocess import RoadNetwork
+from core.routing import build_instance
 from core.solvers import make_amplify_client
 from server.settings import APP_DIR, amplify_token
 
@@ -158,7 +162,6 @@ def solve_phase1(req: Phase1Request):
     if token:
         client = make_amplify_client(token, req.time_limit_ms)
     else:
-        from core.local_client import LocalSAClient
         client = LocalSAClient(method='tabu')
     started = time.time()
     try:
@@ -235,7 +238,12 @@ class Phase2Request(Conditions):
     charge_min: float = 30.0
     flights_builtin: int = 5
     penalty: float = 1.0                # 罰則の強さ（倍率）
-    time_limit_ms: int = 3000           # Amplify の 1 回あたりの制限時間（②と④で 1 回ずつ解く）
+    time_limit_ms: int = 3000           # Amplify の 1 回あたりの制限時間
+    method: Literal['enumeration', 'hybrid'] = 'enumeration'
+    allow_unserved: bool = True
+    recovery_deadlines: dict[str, NonNegativeFloat] = Field(default_factory=dict)
+    return_deadlines: dict[str, NonNegativeFloat] = Field(default_factory=dict)
+    forbidden_assignments: list[tuple[str, str]] = Field(default_factory=list)
 
 
 JOBS = {}                 # 受付番号 → {"status", "stage", "result", "error"}
@@ -274,7 +282,37 @@ def route_result(out, closed, bases):
                 violations=out['violations'], steps=out['steps'],
                 makespan=ev['makespan'], makespan_recovery=ev['makespan_recovery'],
                 makespan_return=ev['makespan_return'], feasible=ev['feasible'],
-                hover_min=inst.cfg.drone.hover_min, seconds=out['seconds'], solver=solver_label())
+                hover_min=inst.cfg.drone.hover_min, seconds=out['seconds'],
+                solver=out['solver'] if 'solver' in out else solver_label())
+
+
+def run_hybrid(pre, cfg, req, token, progress):
+    if req.end_mode not in ('recovery', 'return'):
+        raise ValueError('終了時刻の定義が不明です')
+    if not math.isfinite(req.charge_min) or req.charge_min < 0 or req.flights_builtin < 0:
+        raise ValueError('充電時間と飛行可能回数は0以上を指定してください')
+    inst = build_instance(pre, cfg, end_mode=req.end_mode, cand_per_base=None)
+    vehicle_indices = {v.vehicle_id: i for i, v in enumerate(inst.vehicles)}
+    unknown_sensors = (set(req.recovery_deadlines) | {s for s, _ in req.forbidden_assignments}) - set(pre['sensors'])
+    unknown_vehicles = (set(req.return_deadlines) | {v for _, v in req.forbidden_assignments}) - vehicle_indices.keys()
+    if unknown_sensors or unknown_vehicles:
+        raise ValueError('締切・担当禁止に不明なIDがあります')
+    if any(not math.isfinite(d) for d in (*req.recovery_deadlines.values(), *req.return_deadlines.values())):
+        raise ValueError('締切には有限の分数を指定してください')
+
+    def client_factory(iteration, remaining):
+        if token:
+            return make_amplify_client(token, max(1, min(req.time_limit_ms, int(remaining * 1000))))
+        return LocalSAClient(sweeps=80, seed=iteration - 1)
+
+    out = solve_hybrid(
+        inst, client_factory, allow_unserved=req.allow_unserved, deadlines=req.recovery_deadlines,
+        return_deadlines={vehicle_indices[v]: deadline for v, deadline in req.return_deadlines.items()},
+        forbidden_assignments={(sensor, vehicle_indices[vehicle]) for sensor, vehicle in req.forbidden_assignments},
+        progress=progress,
+    )
+    out['solver'] = 'Amplify AE + 車両別DP' if token else '手元の焼きなまし法 + 車両別DP'
+    return out
 
 
 def run_phase2(job_id, req):
@@ -282,16 +320,26 @@ def run_phase2(job_id, req):
     job = JOBS[job_id]
     try:
         token = amplify_token()
-        if not token:
+        if req.method == 'enumeration' and not token:
             raise ValueError('Amplify のトークンが設定されていません（二段階目は Amplify だけで解きます。'
                              'sensor_app/.env に AMPLIFY_TOKEN を書いてください）')
         cfg = Config()
         cfg.fleet = FleetSpec(charge_min=req.charge_min, flights_builtin=req.flights_builtin)
         job['stage'] = '① 前処理（走行時間と飛行の数え上げ）'
         pre = NETWORK.run(req.closed, req.down, req.bases)
-        out = solve_phase2_steps(pre, cfg, make_amplify_client(token, req.time_limit_ms), end_mode=req.end_mode,
-                                 penalty=req.penalty,   # 1 台が飛ぶ最大回数は solve_phase2 の中で自動で決める
-                                 progress=lambda text: job.update(stage=text))
+
+        def progress(text):
+            job['stage'] = text
+
+        if req.method == 'hybrid':
+            out = run_hybrid(pre, cfg, req, token, progress)
+        else:
+            if req.recovery_deadlines or req.return_deadlines or req.forbidden_assignments or not req.allow_unserved:
+                raise ValueError('締切・担当禁止・全件必須を指定する場合はハイブリッド方式を選んでください')
+            out = solve_phase2_steps(
+                pre, cfg, make_amplify_client(token, req.time_limit_ms), end_mode=req.end_mode,
+                penalty=req.penalty, progress=progress,
+            )
         job['result'] = route_result(out, req.closed, req.bases)
         job['status'] = 'done'
     except Exception as error:

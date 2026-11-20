@@ -2,8 +2,7 @@
 
 - make_amplify_client … Fixstars Amplify AE のクライアントを作る（本番用）。トークンはコードに書かず、
                         .env（環境変数 AMPLIFY_TOKEN）から渡す
-- TabuSearch / LocalAnnealer … 手元で動く確認用の解き方。一段階目でトークンが無いときだけ使う
-                        （二段階目は Amplify だけで解くので使わない）
+- TabuSearch / LocalAnnealer … 手元で動く確認用。トークンがないときの一段階目と二段階目のハイブリッド方式で使う
 
 手元の 2 つは solve(prob) → (x: 0/1 の配列, info: dict) という形。prob は下の QuboProblem。
 

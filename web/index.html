@@ -97,9 +97,13 @@
           <label>センサーの被害の強さ（範囲の中で通信断になる確率 0〜1）<input type="number" id="d-s-strength" step="0.1" min="0" max="1"></label>
           <label>道路が被害を受ける範囲（km）<input type="number" id="d-r-radius" step="5" min="0"></label>
           <label>道路の被害の強さ（0〜1）<input type="number" id="d-r-strength" step="0.1" min="0" max="1"></label>
-          <h3>QUBO（③ルートの数え上げ → ④ルートの選択。②飛行の選択は今は使わない）</h3>
-          <label>罰則の強さ（倍率）<input type="number" id="q-penalty" step="0.5" value="1"></label>
-          <label>Amplify の制限時間（ミリ秒・②と④で1回ずつ）<input type="number" id="q-time" step="500" min="100" value="3000"></label>
+          <h3>巡回の解き方</h3>
+          <label>解法<select id="phase2-method">
+            <option value="enumeration">ルートの列挙とQUBO</option>
+            <option value="hybrid">車両割当QUBOと車両別DP（試作）</option>
+          </select></label>
+          <label>列挙方式の罰則の強さ（倍率）<input type="number" id="q-penalty" step="0.5" value="1"></label>
+          <label>Amplify 1回あたりの制限時間（ミリ秒）<input type="number" id="q-time" step="500" min="100" value="3000"></label>
         </details>
         <button id="btn-p2-solve" class="primary wide">▶ ドローンの巡回を計算（QUBO）</button>
         <div id="p2-status" class="status"></div>
@@ -148,6 +152,6 @@
   </div>
 </div>
 
-<script src="/web/app.js?v=20261105c"></script>
+<script src="/web/app.js?v=phase2-hybrid"></script>
 </body>
 </html>
