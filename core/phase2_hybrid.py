@@ -1,7 +1,8 @@
 """二段階目のハイブリッド方式：車への担当割当（QUBO）＋ 1 台ごとの巡回順（動的計画法）。
 
 流れ（目的は「①回復できる数を最大 → ②その数のまま、最後の回復時刻を最小」の順）
-  段1 締切なしで解く …… 回復できる最大の数 N* と、そのときの終了時刻（上の端）を求める
+  段1 最大フロー（古典）… 回復できる最大の数 N* と担当を厳密に求め、DP で時刻表にして
+                          初めの計画（上の端）にする（phase2_maxflow.py）
   段2 締切 D の二分探索 … 「N* 基を回復し、全部 D 分以内に終わる計画はあるか」を、
                           D を上の端と下の端の真ん中に置いて調べ、範囲を半分ずつ絞る
                           ・見つかった → 上の端 = その計画の終了時刻（もっと短い D を試す）
@@ -23,6 +24,7 @@ import time
 
 from .phase2_assignment import build_assignment_model, solve_assignment
 from .phase2_dp import TIME_EPSILON, solve_vehicle
+from .phase2_maxflow import max_recovery
 from .routing import evaluate, route_times
 
 
@@ -186,19 +188,69 @@ def solve_hybrid(
     stop_reason = 'NO_TARGETS'
     history = []
     max_recovered = 0
+    max_recovered_by_flow = None   # 最大フローで出した N*
+    max_recovered_proven = False   # N* が「本当に最大」と言えるか
     if inst.targets:
-        routes, score, stop_reason = search(None, None, '段1（回復数を最大に）', stop_when_found=False)
-        if routes is not None and score < best_score:
+        # 段1-a：最大フローで N* と担当を求める（古典の厳密な計算）
+        if progress:
+            progress('段1（最大フローで回復できる最大の数を計算）')
+        single_sensor_flights = all(len(flight.sensors) == 1 for flight in inst.flights)
+        flow_eligible = {
+            sensor: [v for v in vehicles
+                     if math.isfinite(earliest[sensor, v])
+                     and earliest[sensor, v] <= deadlines.get(sensor, math.inf) + TIME_EPSILON]
+            for sensor, vehicles in eligible.items()
+        }
+        # 1 回の飛行で 1 基なら「担当できる数 ＝ 飛べる回数」。そうでなければ capacities（大きめの上限）を使う
+        base_capacity = {v: (inst.max_flights() if single_sensor_flights else capacities[v])
+                         for v in range(len(inst.vehicles))}
+        flow = max_recovery(flow_eligible, base_capacity,
+                            vehicle_group={v: veh.base_id for v, veh in enumerate(inst.vehicles)})
+        max_recovered_by_flow = flow['count']
+        # 段1-b：最大フローの担当を DP で時刻表にする（初めの実行可能な計画と、上の端）
+        routes = {}
+        flow_ok = True
+        for vehicle, sensors in sorted(flow['assignment'].items()):
+            result = solve_vehicle(
+                inst, vehicle, sorted(sensors), deadlines=dict(deadlines),
+                return_deadline=return_deadlines.get(vehicle),
+                forbidden_transitions=forbidden_transitions.get(vehicle, ()),
+                max_states=max_states, stop_at=stop_at,
+            )
+            stats['states'] += result.states
+            if result.status != 'FEASIBLE':
+                flow_ok = False
+                break
+            routes[vehicle] = result.route
+        score = None
+        if flow_ok:
+            score = _validate_routes(inst, routes, flow['assignment'], deadlines, return_deadlines,
+                                     forbidden_assignments, forbidden_transitions, allow_unserved)
+        if score is not None:
             best, best_score = routes, score
-        if stop_reason == 'ANNEALER_ERROR' and best is None:
-            raise RuntimeError('割当 QUBO を解けませんでした')
+            stop_reason = 'MAX_FLOW'
+            # 最大フローの数が「本当の最大」と言える条件（phase2_maxflow.py の前提）
+            max_recovered_proven = (single_sensor_flights and not deadlines and not return_deadlines
+                                    and not any(forbidden_transitions.values()))
+        else:
+            # 最大フローの担当が時刻表にできなかった（締切の指定などで前提が崩れた）とき：
+            # アニーリングで「N* 基を回復する担当」を探し、それも無理なら回復数を決めずに探す
+            unserved = n_targets - max_recovered_by_flow
+            routes, score, stop_reason = search(None, unserved if allow_unserved else None,
+                                                '段1（N* 基を回復する担当を探す）', stop_when_found=True)
+            if routes is None:
+                routes, score, stop_reason = search(None, None, '段1（回復数を最大に）', stop_when_found=False)
+            if routes is not None and score < best_score:
+                best, best_score = routes, score
+            if stop_reason == 'ANNEALER_ERROR' and best is None:
+                raise RuntimeError('割当 QUBO を解けませんでした')
         max_recovered = n_targets - best_score[0]
 
     # ---- 段2：回復数 N* のまま、締切 D を二分探索して最後の時刻を縮める ------------------
     upper = None
     proven_lower = None      # 証明済み下界（計算で言える「これより早くは無理」）
     search_lower = None      # 探索上の暫定下限（二分探索の下の端。証明ではない）
-    if best and max_recovered > 0 and stop_reason not in ('TIME_LIMIT', 'ANNEALER_ERROR'):
+    if best is not None and max_recovered > 0 and stop_reason not in ('TIME_LIMIT', 'ANNEALER_ERROR'):
         upper = best_score[1]
         # 下の端：N* 基を回復するなら、どれか 1 基は「各センサーの最短回復時刻」の N* 番目以降になる
         fastest = sorted(
@@ -241,8 +293,8 @@ def solve_hybrid(
         optimality = 'PROVEN'
     else:
         optimality = 'NOT_PROVEN'
-    # 回復数の最大（N*）も、全部回復できたとき以外はアニーリングで見つけた数なので証明ではない
-    max_recovered_proven = best is not None and max_recovered == n_targets
+    # 回復数の最大（N*）：最大フローの前提が成り立っていたか、全部回復できたなら「最大」と言える
+    max_recovered_proven = best is not None and (max_recovered_proven or max_recovered == n_targets)
 
     routes = best if best is not None else {}
     ev = evaluate(inst, routes)
@@ -255,6 +307,7 @@ def solve_hybrid(
             stop_reason=stop_reason, has_solution=best is not None,
             max_recovered=max_recovered,
             max_recovered_proven=max_recovered_proven,
+            max_recovered_by_flow=max_recovered_by_flow,
             deadline_upper=None if upper is None else round(upper, 2),
             lower_bound_proven=None if proven_lower is None else round(proven_lower, 2),
             lower_bound_search=None if search_lower is None else round(search_lower, 2),

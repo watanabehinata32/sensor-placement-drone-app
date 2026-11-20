@@ -143,6 +143,17 @@ class HybridSearchTest(unittest.TestCase):
         self.assertTrue(hybrid["deadline_history"][0]["found"])
         self.assertEqual(hybrid["stop_reason"], "DEADLINE_CONVERGED")
 
+    def test_stage1_uses_max_flow_and_dp_for_the_first_plan(self):
+        """段1は最大フローで N* を決め、その担当を DP で時刻表にして初めの計画にする."""
+        with patch("core.phase2_hybrid.solve_assignment", return_value=[]):
+            result = solve_hybrid(two_vehicle_instance(), lambda iteration, remaining_seconds: None,
+                                  allow_unserved=True)
+        hybrid = result["steps"]["hybrid"]
+        self.assertEqual(hybrid["max_recovered_by_flow"], 2)
+        self.assertTrue(hybrid["max_recovered_proven"])
+        self.assertTrue(hybrid["has_solution"])
+        self.assertEqual(result["missing"], [])
+
     def test_search_failure_raises_only_the_search_lower_bound(self):
         """締切 D で見つからなくても、上がるのは探索上の暫定下限だけ（証明済み下界は上げない）."""
         slow = {0: frozenset({"alpha", "beta"})}   # 段1で見つかる、遅めの計画
