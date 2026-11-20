@@ -96,7 +96,53 @@ class AssignmentModelTest(unittest.TestCase):
             self.assertEqual(len(assignment[0]), 1)
 
 
+    def test_fixed_unserved_count_keeps_recovery_number(self):
+        # 回復数を 1 基に固定すると、2 基とも回る割当も 0 基の割当も罰則がかかる
+        eligible = {"alpha": (0,), "beta": (0,)}
+        costs = {("alpha", 0): 50, ("beta", 0): 100}
+        problem = build_assignment_model(eligible, costs, allow_unserved=True, unserved_count=1)
+        candidates = list(decision_energies(problem))
+        best_energy = min(energy for _, energy in candidates)
+        winners = [problem.decode_bits(bits) for bits, energy in candidates if energy == best_energy]
+        self.assertEqual(winners, [{0: frozenset({"alpha"})}])
+        for bits, _ in candidates:
+            assignment = problem.decode_bits(bits)
+            if assignment is not None:
+                self.assertEqual(sum(len(s) for s in assignment.values()), 1)
+
+
 class HybridSearchTest(unittest.TestCase):
+    def test_deadline_binary_search_shortens_end_time(self):
+        # 段1では 1 台に 2 基とも任せる（最後の回復 8 分）。段2の二分探索で 2 台に分ける計画（4 分）に縮む
+        one_car = {0: frozenset({"alpha", "beta"})}
+        two_cars = {0: frozenset({"alpha"}), 1: frozenset({"beta"})}
+
+        def sampled_assignments(problem, client):
+            if sampled.call_count == 1:
+                order = [one_car]
+            else:
+                order = [two_cars, one_car]
+            for candidate in order:
+                selected = {(sensor, vehicle) for vehicle, sensors in candidate.items() for sensor in sensors}
+                if not selected <= set(problem.pairs):
+                    continue
+                bits = tuple(int(pair in selected) for pair in problem.pairs)
+                if problem.decode_bits(bits) == candidate:
+                    return [candidate]
+            return []
+
+        with patch("core.phase2_hybrid.solve_assignment", side_effect=sampled_assignments) as sampled:
+            result = solve_hybrid(
+                two_vehicle_instance(), lambda iteration, remaining_seconds: None, allow_unserved=False,
+            )
+
+        hybrid = result["steps"]["hybrid"]
+        self.assertEqual(result["eval"]["recover_time"], {"alpha": 3, "beta": 4})
+        self.assertEqual(hybrid["max_recovered"], 2)
+        self.assertEqual(hybrid["deadline_upper"], 4)
+        self.assertTrue(hybrid["deadline_history"][0]["found"])
+        self.assertEqual(hybrid["stop_reason"], "DEADLINE_CONVERGED")
+
     def test_local_annealer_and_dp_respect_forbidden_assignments(self):
         result = solve_hybrid(
             two_vehicle_instance(), lambda iteration, remaining_seconds: LocalSAClient(sweeps=30),

@@ -17,6 +17,7 @@ class AssignmentModel:
     cuts: tuple
     capacities: dict
     statically_infeasible: bool
+    unserved_count: int | None = None   # 未回収にする基数を決めたとき、その数（決めないなら None）
 
     def decode(self, values):
         """エネルギー計算に現れない変数は0として、担当だけを読み出す。"""
@@ -44,6 +45,10 @@ class AssignmentModel:
 
         if len(seen) != len(self.sensors):
             return None
+        # 「回復数を固定」したときは、未回収の基数がちょうどその数か確かめる
+        n_assigned = sum(len(sensors) for sensors in assigned.values())
+        if self.unserved_count is not None and len(self.sensors) - n_assigned != self.unserved_count:
+            return None
         for vehicle, limit in self.capacities.items():
             if len(assigned.get(vehicle, ())) > limit:
                 return None
@@ -67,8 +72,12 @@ def _bounded_slack(generator, limit):
     return slack
 
 
-def build_assignment_model(eligible, costs, *, allow_unserved, cuts=(), capacities=None):
-    """担当変数と、任意の未回収変数・担当上限・完全一致カットを組み立てる。"""
+def build_assignment_model(eligible, costs, *, allow_unserved, cuts=(), capacities=None, unserved_count=None):
+    """担当変数と、任意の未回収変数・担当上限・完全一致カットを組み立てる。
+
+    unserved_count … 締切 D の段で使う。「未回収はちょうど この数」という決まりを足す
+    （一段目で見つけた最大の回復数を、二段目で減らさないようにするため）。
+    """
     cuts = tuple(dict.fromkeys((vehicle, frozenset(sensors)) for vehicle, sensors in cuts))
     try:
         capacities = {vehicle: index(limit) for vehicle, limit in (capacities or {}).items()}
@@ -117,6 +126,18 @@ def build_assignment_model(eligible, costs, *, allow_unserved, cuts=(), capaciti
         model += hard_weight * (total + _bounded_slack(generator, limit) - limit) ** 2
 
     impossible = any(not options for options in choices.values())
+
+    # 回復数を固定する決まり：（未回収の印の合計 − 決めた数）² が 0 になるように罰則をかける
+    if allow_unserved and unserved_count is not None:
+        unserved_total = Poly()
+        for (sensor, vehicle), bit in zip(pairs, variables):
+            if vehicle is None:
+                unserved_total += bit
+        model += hard_weight * (unserved_total - unserved_count) ** 2
+        # 担当できる車が 1 台もいないセンサーが多すぎて、決めた数まで回復できない場合
+        n_can_serve = sum(1 for options in choices.values() if any(v is not None for v in options))
+        if n_can_serve < len(choices) - unserved_count:
+            impossible = True
     for vehicle, failed_set in cuts:
         members = by_vehicle.get(vehicle, {})
         if not failed_set.issubset(members):
@@ -130,7 +151,9 @@ def build_assignment_model(eligible, costs, *, allow_unserved, cuts=(), capaciti
         # 差分数が1以上なら、差分数 - 1を補助変数で表現できる。
         model += hard_weight * (distance - 1 - _bounded_slack(generator, len(members) - 1)) ** 2
 
-    return AssignmentModel(model, variables, pairs, tuple(choices), cuts, capacities, impossible)
+    if not allow_unserved:
+        unserved_count = None   # 未回収を許さないときは、もともと全部回復が決まりになっている
+    return AssignmentModel(model, variables, pairs, tuple(choices), cuts, capacities, impossible, unserved_count)
 
 
 def solve_assignment(problem, client):
