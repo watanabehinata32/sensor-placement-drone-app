@@ -98,9 +98,10 @@ class Instance:
             return flight.flight_min + self.drive_to_base(v, f)    # 着陸して拠点に帰るまで
         return flight.last_recover_off                             # 最後のセンサーの回復まで
 
-    def max_flights(self):
-        """1 台が飛べる回数（内蔵バッテリーの分だけ。予備バッテリーは扱わない）."""
-        return self.cfg.fleet.flights_builtin
+    def max_flights(self, has_spare=False):
+        """1 台が飛べる回数. 予備バッテリーを積んだ車（has_spare=True）は flights_per_spare 回だけ多く飛べる."""
+        extra = self.cfg.fleet.flights_per_spare if has_spare else 0
+        return self.cfg.fleet.flights_builtin + extra
 
 
 def build_instance(res, cfg=None, end_mode="recovery", cand_per_base=1, extra_cand=1):
@@ -203,8 +204,10 @@ def route_times(inst, v, route):
     return launches, end_recovery, end_return
 
 
-def evaluate(inst, routes):
+def evaluate(inst, routes, spares=()):
     """routes = {車の番号: [飛行の番号, ...]} を時刻表にして評価する.
+
+    spares: 予備バッテリーを積んだ車の番号（その車は飛べる回数が増える）。積んだ数が全体の個数を超えたら battery_ok は False
 
     戻り値 dict:
       recovered（回復できた数）/ missing（回れていない）/ duplicated（2 回回った）センサー、
@@ -222,8 +225,8 @@ def evaluate(inst, routes):
         launches, end_recovery, end_return = route_times(inst, v, route)
         if route and not (np.isfinite(end_recovery) and np.isfinite(end_return)):
             finite = False
-        if len(route) > inst.max_flights():
-            battery_ok = False     # 内蔵バッテリーで飛べる回数を超えている
+        if len(route) > inst.max_flights(has_spare=v in spares):
+            battery_ok = False     # バッテリーで飛べる回数を超えている
 
         # 時刻表（できごとの列）
         events = []
@@ -257,9 +260,11 @@ def evaluate(inst, routes):
             makespan_return = max(makespan_return, end_return)
         vehicle_tables.append(dict(
             vehicle_id=veh.vehicle_id, base_id=veh.base_id, route=[inst.flights[f].flight_id for f in route],
-            flights=len(route),
+            flights=len(route), spare=v in spares,
             end_recovery=round(end_recovery, 2), end_return=round(end_return, 2), events=events))
 
+    if len(set(spares)) > inst.cfg.fleet.spare_total:
+        battery_ok = False         # 予備バッテリーを、ある数より多く積んでいる
     missing = [s for s in inst.targets if s not in recover_time]
     makespan = makespan_recovery if inst.end_mode == "recovery" else makespan_return
     return dict(

@@ -107,6 +107,21 @@ python3 -m uvicorn server.main:app --port 8000
 - `python3 tools/check_phase2.py` … サンプルの地震で二段階目を 1 回解き、後処理で足した数などを 1 行で出す（httpx が要る）
 - `python3 tools/try_phase1_settings.py` … 一段階目を重み・制限時間を変えて何通りか解く
 
+## 二段階目のハイブリッド方式（試作）
+
+二段階目の「詳しい設定」→「巡回の解き方」で「車両割当QUBOと車両別DP」を選べます。既定はルートを列挙する従来方式です。ハイブリッド方式は車両への担当割当をアニーリングで生成し、固定された担当の巡回順を車両ごとの動的計画法で計算します。目的は「①回復数を最大 → ②その数のまま最後の時刻を最小」の順で、2 段で解きます。
+
+- 段1：最大フロー（古典の厳密な計算）で回復できる最大の数 N* と担当を求め、DP で時刻表にして初めの計画（上の端）にする
+- 段2：「N* 基を回復して、全部 締切 D 以内に終わる計画はあるか」を二分探索する。D は上の端と下の端（各センサーの最短回復時刻の N* 番目）の真ん中。見つかれば上の端をその終了時刻に、見つからなければ「探索上の暫定下限」だけを D に動かし（「証明済み下界」は動かさない）、差が 1 分以下になったら止める。最短と言えるのは上の端と証明済み下界の差が 1 分以下のときだけで、そうでなければ `steps.hybrid.optimality` が `NOT_PROVEN` になる
+
+各 D では、DP が「この車にこの担当の組は D に間に合わない」と示した組を次の QUBO で選べないようにして解き直します（新しく外す組が出なくなったら、その D はやめる）。全体の計算時間は 60 秒まで、1 つの D で解き直すのは 12 回までです。アニーリングで見つからないことは「無理」の証明ではないので、得られた解は「見つけた中で最短」で、大域最適の証明には使えません。
+
+`POST /api/phase2/solve` の既存項目に `"method": "hybrid"` を追加すると試せます。任意項目は `recovery_deadlines`（センサーID → 回復締切）、`return_deadlines`（車両ID → 帰着締切）、`forbidden_assignments`（`[センサーID, 車両ID]` の一覧）、`allow_unserved`（既定 `true`。 `false` は前処理で到達可能と判定された全対象の回復が必須）です。締切は出発からの分数で、指定時刻ちょうどを含みます。車両IDは例えば拠点 `B1` の1号車なら `B1-1` です。`steps.hybrid.has_solution` は指定条件を満たす計画の有無を示し、従来の `feasible` は到達可能な全対象が回復した場合に真になります。
+
+探索のログは `steps.hybrid.iteration_log`（1 回の「割当 QUBO → DP」ごとに 1 行。段1の最大フローは 0 行目）と `steps.hybrid.totals`（合計）に入ります。各行の項目：締切 `deadline`、`lower_bound_proven`（証明済み下界）・`lower_bound_search`（暫定下限）、`candidates`（候補ごとの結果と実際の最後の回復時刻。時刻が出ていないものは null）、`best_end`（その時点の最良）、`anneal_seconds`・`anneal_calls_total`、`dp_seconds`・`dp_states`・`dp_transitions`、`qubo`（変数・補助変数・二次の結合の数）、`cuts_total`・`cuts_active`、`violations`（決まりを破った解の、破った内容ごとの数）、`cache_hits`（キャッシュは未実装なので null）、`elapsed_seconds`（探索開始からの秒数）。
+
+単体テストは `python3 -m unittest discover -s tests -v` で実行できます。
+
 ## Render で公開する
 
 1. https://dashboard.render.com/blueprint/new?repo=https://github.com/watanabehinata32-png/sensor-placement-drone-app を開く（render.yaml を読む）

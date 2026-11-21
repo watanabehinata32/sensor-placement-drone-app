@@ -22,12 +22,13 @@ class LocalResult:
 class LocalSAClient:
     """AmplifyAEClient の代わりに手元で解く（確認用）"""
 
-    def __init__(self, sweeps=300, method='sa'):
+    def __init__(self, sweeps=300, method='sa', seed=0):
         self.parameters = SimpleNamespace(time_limit_ms=timedelta(seconds=1))
         self.token = ''
         self.version = 'local-sa'
         self.acceptable_degrees = AcceptableDegrees(objective={'Binary': 'Quadratic'})
         self.sweeps = sweeps
+        self.seed = seed
         self.method = method  # 'sa' なら焼きなまし法、'tabu' ならタブーサーチで解く
 
     def solve(self, objective, constraints, dry_run=False):
@@ -51,5 +52,5 @@ class LocalSAClient:
         if self.method == 'tabu':
             x, _ = TabuSearch(iters_per_var=40, restarts=4).solve(prob)
         else:
-            x, _ = LocalAnnealer(sweeps=self.sweeps, restarts=2).solve(prob)
+            x, _ = LocalAnnealer(sweeps=self.sweeps, restarts=2, seed=self.seed).solve(prob)
         return LocalResult(x.astype(float).tolist(), time.perf_counter() - t)

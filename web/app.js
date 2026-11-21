@@ -496,6 +496,7 @@ function updateCounts() {
 function phase2Request() {
   return {
     closed: [...state.closed], down: [...state.down], bases: bases(),
+    method: $('phase2-method').value,
     end_mode: document.querySelector('input[name=end-mode]:checked').value,
     charge_min: +$('f-charge').value, flights_builtin: +$('f-builtin').value,
     penalty: +$('q-penalty').value, time_limit_ms: +$('q-time').value,
@@ -807,14 +808,38 @@ function timetableHtml(result) {
 function renderPhase3() {
   const r = state.result;
   const notes = [`ソルバー: ${r.solver}・計算 ${r.seconds} 秒`];
-  const step2 = r.steps.step2;
-  if (step2.used) {
-    notes.push(`② 飛行の候補 ${step2.candidates} 本 → 選んだ飛行 ${step2.chosen} 本（離陸地点 ${step2.launch_points} か所）`);
+  const hybrid = r.steps.hybrid;
+  if (hybrid) {
+    notes.push(`候補飛行 ${hybrid.flight_candidates} 本・割当の試行 ${hybrid.iterations} 回・除外した割当パターン ${hybrid.cuts} 件`);
+    const stopMessages = {
+      ITERATION_LIMIT: '試行回数の上限に達しました',
+      TIME_LIMIT: '探索時間の上限に達しました',
+      NO_ASSIGNMENT_IN_MODEL: '候補集合の割当条件を満たせませんでした',
+      NO_TARGETS: '回復対象がありません',
+      ANNEALER_ERROR: '割当の再計算に失敗したため、確認済みの計画を表示します',
+    };
+    if (stopMessages[hybrid.stop_reason]) notes.push(stopMessages[hybrid.stop_reason]);
+    if (!hybrid.has_solution) notes.push('条件を満たす計画は得られませんでした');
+    // 最適性の証明状態（証明できていないときは、そのことをはっきり出す）
+    if (hybrid.optimality === 'PROVEN') {
+      notes.push('この回復数での最短であることを確認できました');
+    } else if (hybrid.optimality === 'NOT_PROVEN') {
+      const lb = hybrid.lower_bound_proven;
+      notes.push('最適性は未証明です（制限時間内に見つけた、検証済みの最良の計画）'
+                 + (lb != null ? `・証明済みの下界 ${lb} 分` : ''));
+    }
+    if (hybrid.has_solution && !hybrid.max_recovered_proven) {
+      notes.push('回復数が最大であることも未証明です');
+    }
   } else {
-    // ② を飛ばした版：①の離陸地点を全部 ③ に渡している
-    notes.push(`② は飛ばしました（飛行の候補 ${step2.candidates} 本・離陸地点 ${step2.launch_points} か所を全部 ③ で使用）`);
+    const step2 = r.steps.step2;
+    if (step2.used) {
+      notes.push(`② 飛行の候補 ${step2.candidates} 本 → 選んだ飛行 ${step2.chosen} 本（離陸地点 ${step2.launch_points} か所）`);
+    } else {
+      notes.push(`② は飛ばしました（飛行の候補 ${step2.candidates} 本・離陸地点 ${step2.launch_points} か所を全部 ③ で使用）`);
+    }
+    notes.push(`④ ルートの候補 ${r.steps.step4.n_routes} 本（変数 ${r.steps.step4.n_variables} 個）`);
   }
-  notes.push(`④ ルートの候補 ${r.steps.step4.n_routes} 本（変数 ${r.steps.step4.n_variables} 個）`);
   // 回収できなかったセンサー（QUBO の答えのまま。あとから付け足すことはしない）
   const missingWarning = r.missing.length ? `<p class="warning">⚠ 未回収 ${r.missing.length} 基：${r.missing.join('、')}</p>` : '';
   // 決まりを守れていない所（罰則が効いていない印）
